@@ -5,3 +5,4 @@ edition = "2024"
 description = "Git-native codebase indexer for LLMs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
