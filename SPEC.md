@@ -135,7 +135,7 @@ Targets TBD after initial baseline measurement. The following will be measured:
 
 ### 6.2 Supported Languages
 
-Aria uses tree-sitter grammars. Initial implementation targets ordered by priority: C, Go, Rust, Python. 
+Aria uses tree-sitter grammars. Initial implementation targets ordered by priority: Go, C, Rust, Python. 
 
 Additional languages can be added by implementing a language-specific resolver. The parser itself is language-agnostic (tree-sitter handles grammar).
 
@@ -480,6 +480,9 @@ aria search "<natural language query>" [--limit N]
 ```bash
 # Initialize aria in a repository and creates initial index
 aria init
+
+# Initialize with index excluded from git (adds .aria/ to .gitignore)
+aria init --local
 
 # Configure LLM API for summaries
 aria config set llm.provider anthropic
