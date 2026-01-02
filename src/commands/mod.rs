@@ -1,5 +1,6 @@
 pub mod check;
 pub mod config;
+pub mod embed;
 pub mod hooks;
 pub mod index;
 pub mod init;

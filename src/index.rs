@@ -45,6 +45,8 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
     pub scope: Scope,
     pub calls: Vec<CallSite>,

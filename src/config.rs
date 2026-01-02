@@ -7,6 +7,8 @@ pub struct Config {
     #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
     pub features: FeaturesConfig,
 }
 
@@ -15,6 +17,7 @@ impl Default for Config {
         Self {
             debug: false,
             llm: LlmConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
             features: FeaturesConfig::default(),
         }
     }
@@ -60,6 +63,38 @@ fn default_batch_size() -> usize {
 
 fn default_parallel() -> usize {
     4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    #[serde(default = "default_embed_model")]
+    pub model: String,
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            ollama_url: default_ollama_url(),
+            model: default_embed_model(),
+            batch_size: default_embed_batch_size(),
+        }
+    }
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_embed_model() -> String {
+    "nomic-embed-text".to_string()
+}
+
+fn default_embed_batch_size() -> usize {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

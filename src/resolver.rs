@@ -196,6 +196,7 @@ mod tests {
             line_end: 10,
             signature: format!("func {}()", name),
             summary: None,
+            embedding: None,
             receiver: None,
             scope: Scope::Public,
             calls,

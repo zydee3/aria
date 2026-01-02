@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod embedder;
 mod index;
 mod parser;
 mod resolver;
@@ -26,6 +27,9 @@ enum Command {
 
     /// Incremental index update
     Update(commands::update::UpdateArgs),
+
+    /// Generate embeddings for semantic search
+    Embed,
 
     /// Check if index is current
     Check,
@@ -64,6 +68,7 @@ fn main() -> std::process::ExitCode {
     match cli.command {
         Command::Init(args) => commands::init::run(args),
         Command::Index => commands::index::run(),
+        Command::Embed => commands::embed::run(),
         Command::Update(args) => {
             commands::update::run(args);
             std::process::ExitCode::SUCCESS
@@ -81,10 +86,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Command::Query { cmd } => commands::query::run(cmd),
-        Command::Search(args) => {
-            commands::search::run(args);
-            std::process::ExitCode::SUCCESS
-        }
+        Command::Search(args) => commands::search::run(args),
         Command::Config { cmd } => {
             commands::config::run(cmd);
             std::process::ExitCode::SUCCESS
