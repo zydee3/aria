@@ -8,6 +8,50 @@ use clap::Args;
 use crate::config::Config;
 use crate::index::Index;
 
+const AGENT_MD: &str = r#"# Aria Codebase Index
+
+This project is indexed with [aria](https://github.com/vince-anthropic/aria), a codebase indexer for AI agents.
+
+## Commands
+
+```bash
+# Query functions
+aria query function <name>      # Get function details (signature, calls, callers)
+aria query trace <name>         # Trace call graph (what does this call?)
+aria query usages <name>        # Find callers (what calls this?)
+aria query file <path>          # Get file overview (types, functions)
+aria query list                 # List all functions
+
+# Search
+aria search "natural language"  # Semantic search (requires: aria embed)
+
+# Maintenance
+aria index                      # Rebuild index
+aria embed                      # Generate embeddings for semantic search
+```
+
+## Examples
+
+```bash
+# Find a function by partial name
+aria query function HandleRequest
+
+# Trace what main() calls, 3 levels deep
+aria query trace main --depth 3
+
+# Find all callers of a function
+aria query usages Validate
+
+# Semantic search
+aria search "functions that handle errors"
+```
+
+## Index Location
+
+- `.aria/index.json` - Function/type definitions, call graph
+- `.aria/config.toml` - Configuration
+"#;
+
 #[derive(Args)]
 pub struct InitArgs {
     /// Exclude .aria/ from git (adds .aria/ to .gitignore)
@@ -59,9 +103,15 @@ pub fn run(args: InitArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    
+
     if let Err(e) = fs::write(aria_dir.join("config.toml"), config_toml) {
         eprintln!("error: failed to write config.toml: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Write AGENT.md
+    if let Err(e) = fs::write(aria_dir.join("AGENT.md"), AGENT_MD) {
+        eprintln!("error: failed to write AGENT.md: {e}");
         return ExitCode::FAILURE;
     }
 
