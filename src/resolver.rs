@@ -192,6 +192,7 @@ mod tests {
         Function {
             name: name.to_string(),
             qualified_name: qualified.to_string(),
+            ast_hash: "0000000000000000".to_string(),
             line_start: 1,
             line_end: 10,
             signature: format!("func {}()", name),

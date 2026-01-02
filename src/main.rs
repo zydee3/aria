@@ -31,6 +31,9 @@ enum Command {
     /// Generate embeddings for semantic search
     Embed,
 
+    /// Show functions changed since last index
+    Diff,
+
     /// Check if index is current
     Check,
 
@@ -69,6 +72,7 @@ fn main() -> std::process::ExitCode {
         Command::Init(args) => commands::init::run(args),
         Command::Index => commands::index::run(),
         Command::Embed => commands::embed::run(),
+        Command::Diff => commands::diff::run(),
         Command::Update(args) => {
             commands::update::run(args);
             std::process::ExitCode::SUCCESS

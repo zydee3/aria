@@ -10,24 +10,20 @@ use crate::index::Index;
 
 const AGENT_MD: &str = r#"# Aria Codebase Index
 
-This project is indexed with [aria](https://github.com/vince-anthropic/aria), a codebase indexer for AI agents.
+This project was indexed with [aria](https://github.com/zydee3/aria), a codebase indexer for AI agents.
 
 ## Commands
 
 ```bash
-# Query functions
+# Structure Search - Search by function definition and call graph
 aria query function <name>      # Get function details (signature, calls, callers)
 aria query trace <name>         # Trace call graph (what does this call?)
 aria query usages <name>        # Find callers (what calls this?)
 aria query file <path>          # Get file overview (types, functions)
 aria query list                 # List all functions
 
-# Search
+# Semantic Search - Search by natural language
 aria search "natural language"  # Semantic search (requires: aria embed)
-
-# Maintenance
-aria index                      # Rebuild index
-aria embed                      # Generate embeddings for semantic search
 ```
 
 ## Examples
@@ -45,11 +41,6 @@ aria query usages Validate
 # Semantic search
 aria search "functions that handle errors"
 ```
-
-## Index Location
-
-- `.aria/index.json` - Function/type definitions, call graph
-- `.aria/config.toml` - Configuration
 "#;
 
 #[derive(Args)]

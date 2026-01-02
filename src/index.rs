@@ -39,13 +39,13 @@ pub struct FileEntry {
 pub struct Function {
     pub name: String,
     pub qualified_name: String,
+    #[serde(default)]
+    pub ast_hash: String,
     pub line_start: u32,
     pub line_end: u32,
     pub signature: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
     pub scope: Scope,

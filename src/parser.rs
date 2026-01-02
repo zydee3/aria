@@ -54,8 +54,7 @@ impl GoParser {
             }
         }
 
-        // TODO: compute actual AST hash
-        let ast_hash = format!("{:x}", md5_hash(source));
+        let ast_hash = format!("{:016x}", hash_bytes(source.as_bytes()));
 
         Some(FileEntry {
             ast_hash,
@@ -129,9 +128,14 @@ impl GoParser {
             Vec::new()
         };
 
+        // Compute AST hash from the function's source bytes
+        let func_source = &source[node.start_byte()..node.end_byte()];
+        let ast_hash = format!("{:016x}", hash_bytes(func_source));
+
         Some(Function {
             name,
             qualified_name,
+            ast_hash,
             line_start,
             line_end,
             signature,
@@ -185,9 +189,14 @@ impl GoParser {
             Vec::new()
         };
 
+        // Compute AST hash from the method's source bytes
+        let func_source = &source[node.start_byte()..node.end_byte()];
+        let ast_hash = format!("{:016x}", hash_bytes(func_source));
+
         Some(Function {
             name,
             qualified_name,
+            ast_hash,
             line_start,
             line_end,
             signature,
@@ -389,8 +398,7 @@ fn path_to_file_suffix(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn md5_hash(input: &str) -> u64 {
-    // Simple hash for now - will replace with proper implementation
+fn hash_bytes(input: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
