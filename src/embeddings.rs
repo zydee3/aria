@@ -5,7 +5,7 @@
 //! - embeddings.bin: raw f32 values, EMBEDDING_DIM per function, in same order as .idx
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 

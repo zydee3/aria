@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod embedder;
+mod embeddings;
 mod index;
 mod parser;
 mod resolver;

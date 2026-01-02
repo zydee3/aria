@@ -1,10 +1,12 @@
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Args;
 
 use crate::config::Config;
 use crate::embedder::{cosine_similarity, Embedder};
+use crate::embeddings::EmbeddingStore;
 use crate::index::Index;
 
 #[derive(Args)]
@@ -20,16 +22,18 @@ pub struct SearchArgs {
 }
 
 pub fn run(args: SearchArgs) -> ExitCode {
+    let aria_dir = Path::new(".aria");
+
     // Load config
-    let config_path = ".aria/config.toml";
-    let config: Config = match fs::read_to_string(config_path) {
+    let config_path = aria_dir.join("config.toml");
+    let config: Config = match fs::read_to_string(&config_path) {
         Ok(content) => toml::from_str(&content).unwrap_or_default(),
         Err(_) => Config::default(),
     };
 
     // Load index
-    let index_path = ".aria/index.json";
-    let index: Index = match fs::read_to_string(index_path) {
+    let index_path = aria_dir.join("index.json");
+    let index: Index = match fs::read_to_string(&index_path) {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(idx) => idx,
             Err(e) => {
@@ -43,15 +47,17 @@ pub fn run(args: SearchArgs) -> ExitCode {
         }
     };
 
-    // Check if any functions have embeddings
-    let has_embeddings = index
-        .files
-        .values()
-        .flat_map(|f| &f.functions)
-        .any(|f| f.embedding.is_some());
+    // Load embeddings
+    let store = match EmbeddingStore::load(aria_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error loading embeddings: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    if !has_embeddings {
-        eprintln!("No embeddings in index. Run 'aria embed' to generate embeddings.");
+    if store.is_empty() {
+        eprintln!("No embeddings found. Run 'aria embed' to generate embeddings.");
         return ExitCode::FAILURE;
     }
 
@@ -75,16 +81,23 @@ pub fn run(args: SearchArgs) -> ExitCode {
         }
     };
 
+    // Build lookup: qualified_name -> (path, summary)
+    let mut func_info: std::collections::HashMap<&str, (&str, Option<&str>)> =
+        std::collections::HashMap::new();
+    for (path, file_entry) in &index.files {
+        for func in &file_entry.functions {
+            func_info.insert(&func.qualified_name, (path, func.summary.as_deref()));
+        }
+    }
+
     // Compute similarities and collect results
     let mut results: Vec<(f32, &str, &str, Option<&str>)> = Vec::new();
 
-    for (path, file_entry) in &index.files {
-        for func in &file_entry.functions {
-            if let Some(ref embedding) = func.embedding {
-                let similarity = cosine_similarity(&query_embedding, embedding);
-                if similarity >= args.threshold {
-                    results.push((similarity, path, &func.qualified_name, func.summary.as_deref()));
-                }
+    for (qualified_name, embedding) in store.iter() {
+        let similarity = cosine_similarity(&query_embedding, embedding);
+        if similarity >= args.threshold {
+            if let Some(&(path, summary)) = func_info.get(qualified_name.as_str()) {
+                results.push((similarity, path, qualified_name, summary));
             }
         }
     }
@@ -100,7 +113,9 @@ pub fn run(args: SearchArgs) -> ExitCode {
 
     println!("\nSearch results for: \"{}\"\n", args.query);
 
-    for (i, (similarity, path, qualified_name, summary)) in results.iter().take(args.limit).enumerate() {
+    for (i, (similarity, path, qualified_name, summary)) in
+        results.iter().take(args.limit).enumerate()
+    {
         println!(
             "{}. {} ({:.1}%)",
             i + 1,

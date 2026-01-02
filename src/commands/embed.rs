@@ -1,14 +1,18 @@
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 use crate::config::Config;
 use crate::embedder::Embedder;
+use crate::embeddings::EmbeddingStore;
 use crate::index::Index;
 
 pub fn run() -> ExitCode {
+    let aria_dir = Path::new(".aria");
+
     // Load config
-    let config_path = ".aria/config.toml";
-    let config: Config = match fs::read_to_string(config_path) {
+    let config_path = aria_dir.join("config.toml");
+    let config: Config = match fs::read_to_string(&config_path) {
         Ok(content) => toml::from_str(&content).unwrap_or_default(),
         Err(_) => {
             eprintln!("No config found. Run 'aria init' first.");
@@ -17,8 +21,8 @@ pub fn run() -> ExitCode {
     };
 
     // Load index
-    let index_path = ".aria/index.json";
-    let mut index: Index = match fs::read_to_string(index_path) {
+    let index_path = aria_dir.join("index.json");
+    let index: Index = match fs::read_to_string(&index_path) {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(idx) => idx,
             Err(e) => {
@@ -28,6 +32,15 @@ pub fn run() -> ExitCode {
         },
         Err(_) => {
             eprintln!("No index found. Run 'aria index' first.");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Load existing embeddings
+    let mut store = match EmbeddingStore::load(aria_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error loading embeddings: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -44,12 +57,12 @@ pub fn run() -> ExitCode {
 
     // Collect functions that need embeddings
     // We embed: signature + summary (if available)
-    let mut to_embed: Vec<(String, String, String)> = Vec::new(); // (file_path, qualified_name, text)
+    let mut to_embed: Vec<(String, String)> = Vec::new(); // (qualified_name, text)
 
-    for (path, file_entry) in &index.files {
+    for file_entry in index.files.values() {
         for func in &file_entry.functions {
             // Skip if already has embedding
-            if func.embedding.is_some() {
+            if store.contains(&func.qualified_name) {
                 continue;
             }
 
@@ -60,7 +73,7 @@ pub fn run() -> ExitCode {
                 func.signature.clone()
             };
 
-            to_embed.push((path.clone(), func.qualified_name.clone(), text));
+            to_embed.push((func.qualified_name.clone(), text));
         }
     }
 
@@ -72,29 +85,20 @@ pub fn run() -> ExitCode {
     println!("Generating embeddings for {} functions...", to_embed.len());
 
     // Extract just the texts for batch embedding
-    let texts: Vec<String> = to_embed.iter().map(|(_, _, text)| text.clone()).collect();
+    let texts: Vec<String> = to_embed.iter().map(|(_, text)| text.clone()).collect();
 
     // Embed all texts
     let embeddings = embedder.embed_batch(&texts);
 
-    // Update index with embeddings
+    // Update store with embeddings
     let mut success_count = 0;
     let mut error_count = 0;
 
-    for ((path, qualified_name, _), embedding_result) in to_embed.iter().zip(embeddings.into_iter()) {
+    for ((qualified_name, _), embedding_result) in to_embed.iter().zip(embeddings.into_iter()) {
         match embedding_result {
             Ok(embedding) => {
-                // Find and update the function in the index
-                if let Some(file_entry) = index.files.get_mut(path) {
-                    if let Some(func) = file_entry
-                        .functions
-                        .iter_mut()
-                        .find(|f| &f.qualified_name == qualified_name)
-                    {
-                        func.embedding = Some(embedding);
-                        success_count += 1;
-                    }
-                }
+                store.insert(qualified_name.clone(), embedding);
+                success_count += 1;
             }
             Err(e) => {
                 if error_count == 0 {
@@ -105,17 +109,16 @@ pub fn run() -> ExitCode {
         }
     }
 
-    // Save updated index
-    println!("Saving index...");
-    let json = serde_json::to_string_pretty(&index).expect("Failed to serialize index");
-    if let Err(e) = fs::write(index_path, json) {
-        eprintln!("Error writing index: {e}");
+    // Save embeddings
+    println!("Saving embeddings...");
+    if let Err(e) = store.save(aria_dir) {
+        eprintln!("Error writing embeddings: {e}");
         return ExitCode::FAILURE;
     }
 
     println!(
-        "Done. Embedded {} functions ({} errors).",
-        success_count, error_count
+        "Done. Embedded {} functions ({} errors). Total: {} embeddings.",
+        success_count, error_count, store.len()
     );
 
     if error_count > 0 {
