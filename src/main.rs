@@ -4,6 +4,7 @@ mod index;
 mod parser;
 mod resolver;
 mod summarizer;
+mod topo;
 
 use clap::{Parser, Subcommand};
 

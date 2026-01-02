@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub debug: bool,
+    #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
     pub features: FeaturesConfig,
@@ -11,6 +13,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            debug: false,
             llm: LlmConfig::default(),
             features: FeaturesConfig::default(),
         }

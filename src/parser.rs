@@ -15,7 +15,7 @@ impl GoParser {
         Self { parser }
     }
 
-    pub fn parse_file(&mut self, source: &str, _path: &str) -> Option<FileEntry> {
+    pub fn parse_file(&mut self, source: &str, path: &str) -> Option<FileEntry> {
         let tree = self.parser.parse(source, None)?;
         let root = tree.root_node();
 
@@ -25,22 +25,30 @@ impl GoParser {
         // Extract package name for qualified names
         let package_name = self.extract_package_name(&root, source.as_bytes());
 
+        // Use directory path as prefix to disambiguate packages with same name in different locations
+        // e.g., "internal/foo/initializer/init.go" -> "internal/foo/initializer"
+        // This mirrors Go's import path behavior
+        let path_prefix = path_to_prefix(path);
+
+        // For init functions, we need file-level disambiguation even within same package
+        let file_suffix = path_to_file_suffix(path);
+
         // Walk top-level declarations
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             match child.kind() {
                 "function_declaration" => {
-                    if let Some(func) = self.extract_function(&child, source.as_bytes(), &package_name, None) {
+                    if let Some(func) = self.extract_function(&child, source.as_bytes(), &package_name, &path_prefix, &file_suffix, None) {
                         functions.push(func);
                     }
                 }
                 "method_declaration" => {
-                    if let Some(func) = self.extract_method(&child, source.as_bytes(), &package_name) {
+                    if let Some(func) = self.extract_method(&child, source.as_bytes(), &package_name, &path_prefix) {
                         functions.push(func);
                     }
                 }
                 "type_declaration" => {
-                    self.extract_types(&child, source.as_bytes(), &package_name, &mut types);
+                    self.extract_types(&child, source.as_bytes(), &package_name, &path_prefix, &mut types);
                 }
                 _ => {}
             }
@@ -77,12 +85,25 @@ impl GoParser {
         node: &tree_sitter::Node,
         source: &[u8],
         package: &str,
+        path_prefix: &str,
+        file_suffix: &str,
         receiver: Option<String>,
     ) -> Option<Function> {
         let name_node = node.child_by_field_name("name")?;
         let name = node_text(&name_node, source).to_string();
 
-        let qualified_name = if package.is_empty() {
+        // Use path_prefix (directory path) to disambiguate packages with same name
+        // Use file_suffix for init functions to disambiguate (one init per file is allowed in Go)
+        let qualified_name = if name == "init" && !file_suffix.is_empty() {
+            // init functions need file-level disambiguation
+            if !path_prefix.is_empty() {
+                format!("{}.init@{}", path_prefix, file_suffix)
+            } else {
+                format!("{}.init@{}", package, file_suffix)
+            }
+        } else if !path_prefix.is_empty() {
+            format!("{}.{}", path_prefix, name)
+        } else if package.is_empty() {
             name.clone()
         } else {
             format!("{}.{}", package, name)
@@ -127,6 +148,7 @@ impl GoParser {
         node: &tree_sitter::Node,
         source: &[u8],
         package: &str,
+        path_prefix: &str,
     ) -> Option<Function> {
         // Get receiver
         let receiver_node = node.child_by_field_name("receiver")?;
@@ -135,7 +157,10 @@ impl GoParser {
         let name_node = node.child_by_field_name("name")?;
         let name = node_text(&name_node, source).to_string();
 
-        let qualified_name = if package.is_empty() {
+        // Use path_prefix (directory path) to disambiguate packages with same name
+        let qualified_name = if !path_prefix.is_empty() {
+            format!("{}.{}.{}", path_prefix, receiver_type, name)
+        } else if package.is_empty() {
             format!("{}.{}", receiver_type, name)
         } else {
             format!("{}.{}.{}", package, receiver_type, name)
@@ -226,13 +251,14 @@ impl GoParser {
         node: &tree_sitter::Node,
         source: &[u8],
         package: &str,
+        path_prefix: &str,
         types: &mut Vec<TypeDef>,
     ) {
         // type_declaration contains type_spec children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "type_spec" {
-                if let Some(type_def) = self.extract_type_spec(&child, source, package) {
+                if let Some(type_def) = self.extract_type_spec(&child, source, package, path_prefix) {
                     types.push(type_def);
                 }
             }
@@ -244,6 +270,7 @@ impl GoParser {
         node: &tree_sitter::Node,
         source: &[u8],
         package: &str,
+        path_prefix: &str,
     ) -> Option<TypeDef> {
         let name_node = node.child_by_field_name("name")?;
         let name = node_text(&name_node, source).to_string();
@@ -255,7 +282,10 @@ impl GoParser {
             _ => TypeKind::Typedef,
         };
 
-        let qualified_name = if package.is_empty() {
+        // Use path_prefix (directory path) to disambiguate packages with same name
+        let qualified_name = if !path_prefix.is_empty() {
+            format!("{}.{}", path_prefix, name)
+        } else if package.is_empty() {
             name.clone()
         } else {
             format!("{}.{}", package, name)
@@ -322,6 +352,39 @@ impl GoParser {
 
 fn node_text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+/// Convert a file path to a prefix for qualified names.
+/// e.g., "./cmd/foo/main.go" -> "cmd/foo"
+/// e.g., "internal/bar/main.go" -> "internal/bar"
+fn path_to_prefix(path: &str) -> String {
+    // Remove leading "./"
+    let path = path.strip_prefix("./").unwrap_or(path);
+
+    // Remove the filename, keep directory
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let dir_str = dir.to_string_lossy();
+        if dir_str.is_empty() || dir_str == "." {
+            // File is in root, use filename without extension
+            std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            dir_str.to_string()
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Convert a file path to a suffix for init function disambiguation.
+/// e.g., "./internal/foo/bar.go" -> "bar"
+fn path_to_file_suffix(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 fn md5_hash(input: &str) -> u64 {

@@ -1,12 +1,14 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 #[derive(Debug)]
 pub struct Summarizer {
     batch_size: usize,
     parallel: usize,
+    debug: bool,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,8 @@ pub struct SummaryRequest {
     pub id: usize,
     pub signature: String,
     pub body: String,
+    /// Summaries of callees to include as context (callee_name -> summary)
+    pub callee_context: Vec<(String, String)>,
 }
 
 /// Result of summarization
@@ -48,10 +52,11 @@ pub struct SummaryResult {
 }
 
 impl Summarizer {
-    pub fn new(batch_size: usize, parallel: usize) -> Self {
+    pub fn new(batch_size: usize, parallel: usize, debug: bool) -> Self {
         Self {
             batch_size: batch_size.max(1),
             parallel: parallel.max(1),
+            debug,
         }
     }
 
@@ -67,9 +72,13 @@ impl Summarizer {
             .map(|chunk| chunk.to_vec())
             .collect();
 
+        let total_batches = batches.len();
+        let completed_batches = Arc::new(AtomicUsize::new(0));
+
         // Process batches in parallel using threads
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
+        let debug = self.debug;
 
         // Semaphore-like behavior: process `parallel` batches at a time
         for batch_chunk in batches.chunks(self.parallel) {
@@ -77,8 +86,9 @@ impl Summarizer {
 
             for batch in batch_chunk {
                 let tx = tx.clone();
+                let completed = Arc::clone(&completed_batches);
                 let handle = thread::spawn(move || {
-                    let results = process_batch(batch);
+                    let results = process_batch(batch, debug, completed, total_batches);
                     for result in results {
                         let _ = tx.send(result);
                     }
@@ -100,12 +110,39 @@ impl Summarizer {
 }
 
 /// Process a batch of functions, returning individual results
-fn process_batch(batch: Vec<SummaryRequest>) -> Vec<SummaryResult> {
+fn process_batch(
+    batch: Vec<SummaryRequest>,
+    debug: bool,
+    completed: Arc<AtomicUsize>,
+    total_batches: usize,
+) -> Vec<SummaryResult> {
+    let batch_num = completed.fetch_add(1, Ordering::SeqCst) + 1;
+
     if batch.len() == 1 {
         // Single function - simple prompt
         let req = &batch[0];
-        let prompt = build_single_prompt(&req.signature, &req.body);
+        let prompt = build_single_prompt(&req.signature, &req.body, &req.callee_context);
         let result = call_claude(&prompt);
+
+        if debug {
+            let response_str = match &result {
+                Ok(resp) => resp.clone(),
+                Err(e) => format!("[ERROR] {}", e),
+            };
+            eprintln!(
+                "\n{}\n[Batch {}/{}]\n{}\n{}\n{}\n{}\n",
+                "=".repeat(60),
+                batch_num,
+                total_batches,
+                format!("PROMPT (single):\n{}", prompt),
+                "-".repeat(40),
+                format!("RESPONSE:\n{}", response_str),
+                "=".repeat(60),
+            );
+        } else {
+            eprint!("\r  Batch {}/{}", batch_num, total_batches);
+        }
+
         return vec![SummaryResult {
             id: req.id,
             summary: result,
@@ -114,7 +151,28 @@ fn process_batch(batch: Vec<SummaryRequest>) -> Vec<SummaryResult> {
 
     // Multiple functions - batch prompt with structured output
     let prompt = build_batch_prompt(&batch);
-    match call_claude(&prompt) {
+    let result = call_claude(&prompt);
+
+    if debug {
+        let response_str = match &result {
+            Ok(resp) => resp.clone(),
+            Err(e) => format!("[ERROR] {}", e),
+        };
+        eprintln!(
+            "\n{}\n[Batch {}/{}]\n{}\n{}\n{}\n{}\n",
+            "=".repeat(60),
+            batch_num,
+            total_batches,
+            format!("PROMPT (batch of {}):\n{}", batch.len(), prompt),
+            "-".repeat(40),
+            format!("RESPONSE:\n{}", response_str),
+            "=".repeat(60),
+        );
+    } else {
+        eprint!("\r  Batch {}/{}", batch_num, total_batches);
+    }
+
+    match result {
         Ok(response) => parse_batch_response(&batch, &response),
         Err(e) => {
             // If batch fails, return error for all
@@ -129,15 +187,24 @@ fn process_batch(batch: Vec<SummaryRequest>) -> Vec<SummaryResult> {
     }
 }
 
-fn build_single_prompt(signature: &str, body: &str) -> String {
-    format!(
+fn build_single_prompt(signature: &str, body: &str, callee_context: &[(String, String)]) -> String {
+    let mut prompt = String::from(
         "Summarize what this function does in 1-2 sentences. \
          Focus on behavior, not implementation details. \
          Do not repeat documentation comments. \
-         Reply with ONLY the summary, no preamble.\n\n\
-         Function: {signature}\n\
-         Body:\n{body}"
-    )
+         Reply with ONLY the summary, no preamble.\n\n",
+    );
+
+    if !callee_context.is_empty() {
+        prompt.push_str("This function calls:\n");
+        for (name, summary) in callee_context {
+            prompt.push_str(&format!("- {name}(): \"{summary}\"\n"));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str(&format!("Function: {signature}\nBody:\n{body}"));
+    prompt
 }
 
 fn build_batch_prompt(batch: &[SummaryRequest]) -> String {
@@ -151,12 +218,17 @@ fn build_batch_prompt(batch: &[SummaryRequest]) -> String {
     );
 
     for (i, req) in batch.iter().enumerate() {
-        prompt.push_str(&format!(
-            "=== Function {} ===\n{}\n{}\n\n",
-            i + 1,
-            req.signature,
-            req.body
-        ));
+        prompt.push_str(&format!("=== Function {} ===\n", i + 1));
+
+        if !req.callee_context.is_empty() {
+            prompt.push_str("This function calls:\n");
+            for (name, summary) in &req.callee_context {
+                prompt.push_str(&format!("- {name}(): \"{summary}\"\n"));
+            }
+            prompt.push('\n');
+        }
+
+        prompt.push_str(&format!("{}\n{}\n\n", req.signature, req.body));
     }
 
     prompt
@@ -212,9 +284,22 @@ mod tests {
 
     #[test]
     fn test_build_single_prompt() {
-        let prompt = build_single_prompt("func Foo(x int) int", "{ return x * 2 }");
+        let prompt = build_single_prompt("func Foo(x int) int", "{ return x * 2 }", &[]);
         assert!(prompt.contains("func Foo"));
         assert!(prompt.contains("return x * 2"));
+        assert!(!prompt.contains("This function calls"));
+    }
+
+    #[test]
+    fn test_build_single_prompt_with_context() {
+        let context = vec![
+            ("helper".to_string(), "Does a helper thing".to_string()),
+            ("util".to_string(), "Utility function".to_string()),
+        ];
+        let prompt = build_single_prompt("func Foo(x int) int", "{ return x * 2 }", &context);
+        assert!(prompt.contains("This function calls:"));
+        assert!(prompt.contains("helper(): \"Does a helper thing\""));
+        assert!(prompt.contains("util(): \"Utility function\""));
     }
 
     #[test]
@@ -224,17 +309,20 @@ mod tests {
                 id: 0,
                 signature: "func A()".to_string(),
                 body: "{}".to_string(),
+                callee_context: vec![],
             },
             SummaryRequest {
                 id: 1,
                 signature: "func B()".to_string(),
                 body: "{}".to_string(),
+                callee_context: vec![("helper".to_string(), "Helps".to_string())],
             },
         ];
         let prompt = build_batch_prompt(&batch);
         assert!(prompt.contains("=== Function 1 ==="));
         assert!(prompt.contains("=== Function 2 ==="));
         assert!(prompt.contains("[N]:"));
+        assert!(prompt.contains("helper(): \"Helps\""));
     }
 
     #[test]
@@ -244,11 +332,13 @@ mod tests {
                 id: 0,
                 signature: "func A()".to_string(),
                 body: "{}".to_string(),
+                callee_context: vec![],
             },
             SummaryRequest {
                 id: 1,
                 signature: "func B()".to_string(),
                 body: "{}".to_string(),
+                callee_context: vec![],
             },
         ];
         let response = "[1]: Does thing A\n[2]: Does thing B";

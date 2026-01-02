@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use walkdir::WalkDir;
 
@@ -10,6 +11,7 @@ use crate::index::Index;
 use crate::parser::GoParser;
 use crate::resolver::Resolver;
 use crate::summarizer::{Summarizer, SummaryRequest};
+use crate::topo;
 
 pub fn run() -> ExitCode {
     let aria_dir = Path::new(".aria");
@@ -76,6 +78,11 @@ pub fn run() -> ExitCode {
             }
         }
     }
+
+    println!(
+        "Parsed {} files: {} functions, {} types",
+        file_count, func_count, type_count
+    );
 
     // Resolve call targets and populate called_by
     let mut resolver = Resolver::new();
@@ -145,28 +152,168 @@ fn load_config(aria_dir: &Path) -> Config {
 }
 
 fn run_summarization(config: &Config, index: &mut Index, sources: &HashMap<String, String>) {
-    let summarizer = Summarizer::new(config.llm.batch_size, config.llm.parallel);
+    let summarizer = Summarizer::new(config.llm.batch_size, config.llm.parallel, config.debug);
 
-    // Collect functions that need summarization with their location info
-    let mut requests: Vec<SummaryRequest> = Vec::new();
-    let mut locations: Vec<(String, usize)> = Vec::new(); // (path, func_idx)
+    // Build the call graph: qualified_name -> set of callee qualified_names
+    let topo_start = Instant::now();
+    let mut all_functions: HashSet<String> = HashSet::new();
+    let mut calls_map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut total_funcs = 0;
 
+    for entry in index.files.values() {
+        for func in &entry.functions {
+            total_funcs += 1;
+            if config.debug && all_functions.contains(&func.qualified_name) {
+                eprintln!("warning: duplicate qualified_name: {}", func.qualified_name);
+            }
+            all_functions.insert(func.qualified_name.clone());
+
+            let callees: HashSet<String> = func
+                .calls
+                .iter()
+                .filter(|c| c.target != "[unresolved]")
+                .map(|c| c.target.clone())
+                .collect();
+
+            if !callees.is_empty() {
+                calls_map.insert(func.qualified_name.clone(), callees);
+            }
+        }
+    }
+
+    // Compute levels (topological sort)
+    let levels = topo::assign_levels(&all_functions, &calls_map);
+    let level_groups = topo::group_by_level(&levels);
+    let topo_elapsed = topo_start.elapsed();
+
+    let funcs_with_calls = calls_map.len();
+    let total_in_levels: usize = level_groups.iter().map(|g| g.len()).sum();
+    let duplicates = total_funcs - all_functions.len();
+    println!(
+        "Computed topology in {:.2?} ({} functions, {} duplicates, {} with resolved calls, {} in levels)",
+        topo_elapsed, all_functions.len(), duplicates, funcs_with_calls, total_in_levels
+    );
+
+    // Build lookup: qualified_name -> (path, func_idx)
+    let mut func_locations: HashMap<String, (String, usize)> = HashMap::new();
     for (path, entry) in index.files.iter() {
-        let Some(source) = sources.get(path) else {
-            continue;
-        };
-        let lines: Vec<&str> = source.lines().collect();
-
         for (func_idx, func) in entry.functions.iter().enumerate() {
+            func_locations.insert(func.qualified_name.clone(), (path.clone(), func_idx));
+        }
+    }
+
+    // Track summaries as we generate them (for callee context)
+    let mut summaries: HashMap<String, String> = HashMap::new();
+
+    // Pre-populate with existing summaries
+    for entry in index.files.values() {
+        for func in &entry.functions {
+            if let Some(summary) = &func.summary {
+                summaries.insert(func.qualified_name.clone(), summary.clone());
+            }
+        }
+    }
+
+    // Count functions to summarize (excluding those with existing summaries)
+    let total: usize = level_groups
+        .iter()
+        .flat_map(|g| g.iter())
+        .filter(|qn| !summaries.contains_key(*qn))
+        .count();
+
+    if total == 0 {
+        return;
+    }
+
+    let num_levels = level_groups.len();
+    println!(
+        "Generating summaries for {} functions in {} levels (batch={}, parallel={})...",
+        total, num_levels, config.llm.batch_size, config.llm.parallel
+    );
+
+    let mut summary_count = 0;
+    let mut error_count = 0;
+    let summarization_start = Instant::now();
+
+    // Process each level sequentially (so callee summaries are available for higher levels)
+    for (level, funcs_at_level) in level_groups.iter().enumerate() {
+        let level_start = Instant::now();
+
+        if config.debug {
+            eprintln!(
+                "debug: Starting level {} with {} functions, {} summaries available",
+                level,
+                funcs_at_level.len(),
+                summaries.len()
+            );
+        }
+
+        // Collect requests for this level
+        let mut requests: Vec<SummaryRequest> = Vec::new();
+        let mut request_qnames: Vec<String> = Vec::new();
+
+        for qualified_name in funcs_at_level {
             // Skip if already has summary
-            if func.summary.is_some() {
+            if summaries.contains_key(qualified_name) {
                 continue;
             }
 
-            // Extract function body from source using line numbers
+            let Some((path, func_idx)) = func_locations.get(qualified_name) else {
+                continue;
+            };
+            let Some(source) = sources.get(path) else {
+                continue;
+            };
+            let Some(entry) = index.files.get(path) else {
+                continue;
+            };
+            let Some(func) = entry.functions.get(*func_idx) else {
+                continue;
+            };
+
+            let lines: Vec<&str> = source.lines().collect();
             let body = extract_body(&lines, func.line_start, func.line_end);
             if body.is_empty() {
                 continue;
+            }
+
+            // Build callee context from already-computed summaries
+            let resolved_calls: Vec<_> = func
+                .calls
+                .iter()
+                .filter(|c| c.target != "[unresolved]")
+                .collect();
+
+            let callee_context: Vec<(String, String)> = resolved_calls
+                .iter()
+                .filter_map(|c| {
+                    summaries.get(&c.target).map(|s| {
+                        // Use simple name for readability
+                        let simple_name = c.target.rsplit('.').next().unwrap_or(&c.target);
+                        (simple_name.to_string(), s.clone())
+                    })
+                })
+                .collect();
+
+            // Debug: show missed lookups and successful ones
+            if config.debug && !resolved_calls.is_empty() {
+                if callee_context.is_empty() {
+                    let missed: Vec<_> = resolved_calls.iter().map(|c| &c.target).collect();
+                    eprintln!(
+                        "debug [level {}]: {} has {} resolved calls but 0 found in summaries: {:?}",
+                        level,
+                        qualified_name,
+                        resolved_calls.len(),
+                        missed
+                    );
+                } else {
+                    eprintln!(
+                        "debug [level {}]: {} has {} callee summaries as context",
+                        level,
+                        qualified_name,
+                        callee_context.len()
+                    );
+                }
             }
 
             let id = requests.len();
@@ -174,49 +321,59 @@ fn run_summarization(config: &Config, index: &mut Index, sources: &HashMap<Strin
                 id,
                 signature: func.signature.clone(),
                 body,
+                callee_context,
             });
-            locations.push((path.clone(), func_idx));
+            request_qnames.push(qualified_name.clone());
         }
-    }
 
-    let total = requests.len();
-    if total == 0 {
-        return;
-    }
+        if requests.is_empty() {
+            continue;
+        }
 
-    println!(
-        "Generating summaries for {} functions (batch={}, parallel={})...",
-        total, config.llm.batch_size, config.llm.parallel
-    );
+        let funcs_in_level = requests.len();
+        let with_context = requests.iter().filter(|r| !r.callee_context.is_empty()).count();
 
-    // Process all summaries with batching and parallelism
-    let results = summarizer.summarize_batch(requests);
+        // Process this level
+        let results = summarizer.summarize_batch(requests);
 
-    let mut summary_count = 0;
-    let mut error_count = 0;
+        for result in results {
+            let qualified_name = &request_qnames[result.id];
 
-    for result in results {
-        let (path, func_idx) = &locations[result.id];
+            match result.summary {
+                Ok(summary) => {
+                    // Store in our map for use as context in later levels
+                    summaries.insert(qualified_name.clone(), summary.clone());
 
-        match result.summary {
-            Ok(summary) => {
-                if let Some(entry) = index.files.get_mut(path) {
-                    if let Some(func) = entry.functions.get_mut(*func_idx) {
-                        func.summary = Some(summary);
-                        summary_count += 1;
+                    // Update the index
+                    if let Some((path, func_idx)) = func_locations.get(qualified_name) {
+                        if let Some(entry) = index.files.get_mut(path) {
+                            if let Some(func) = entry.functions.get_mut(*func_idx) {
+                                func.summary = Some(summary);
+                                summary_count += 1;
+                            }
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("warning: failed to summarize: {}", e);
-                error_count += 1;
+                Err(e) => {
+                    eprintln!("warning: failed to summarize {}: {}", qualified_name, e);
+                    error_count += 1;
+                }
             }
         }
+
+        let level_elapsed = level_start.elapsed();
+        // Clear the progress line and print level summary
+        eprint!("\r");
+        println!(
+            "  Level {}: {} functions ({} with callee context) in {:.2?}",
+            level, funcs_in_level, with_context, level_elapsed
+        );
     }
 
+    let total_elapsed = summarization_start.elapsed();
     println!(
-        "Generated {} summaries ({} errors)",
-        summary_count, error_count
+        "Generated {} summaries ({} errors) in {:.2?}",
+        summary_count, error_count, total_elapsed
     );
 }
 
