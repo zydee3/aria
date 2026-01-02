@@ -78,10 +78,7 @@ fn main() -> std::process::ExitCode {
             commands::stats::run();
             std::process::ExitCode::SUCCESS
         }
-        Command::Query { cmd } => {
-            commands::query::run(cmd);
-            std::process::ExitCode::SUCCESS
-        }
+        Command::Query { cmd } => commands::query::run(cmd),
         Command::Search(args) => {
             commands::search::run(args);
             std::process::ExitCode::SUCCESS
