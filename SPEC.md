@@ -154,9 +154,10 @@ Indexes are stored as JSON in `.aria/` at the repository root.
 **File structure:**
 ```
 .aria/
-├── index.json        # Structural index
+├── index.json        # Structural index (functions, types, calls, summaries)
 ├── config.toml       # Configuration
-├── embeddings.bin    # Vector embeddings (optional)
+├── embeddings.idx    # Qualified names for embeddings (optional)
+├── embeddings.bin    # Vector embeddings as raw f32 (optional)
 └── cache/            # Transient computation cache
 ```
 
@@ -174,6 +175,7 @@ Indexes are stored as JSON in `.aria/` at the repository root.
         {
           "name": "string",
           "qualified_name": "string",
+          "ast_hash": "string",
           "line_start": "integer",
           "line_end": "integer",
           "signature": "string",
@@ -207,6 +209,8 @@ Indexes are stored as JSON in `.aria/` at the repository root.
 ```
 
 **Field notes:**
+- `ast_hash` (file): Hash of file contents for quick change detection
+- `ast_hash` (function): Hash of function source bytes for per-function change detection
 - `receiver`: Go receiver type, null for languages without receivers
 - `scope`: One of "public", "static", "internal"
 - `kind`: One of "struct", "interface", "typedef", "enum"
@@ -461,6 +465,9 @@ aria validate
 
 # Show index statistics
 aria stats
+
+# Show functions changed since last index
+aria diff
 ```
 
 ### 9.2 Query Commands
@@ -583,10 +590,12 @@ Aria performs static analysis only. The following cannot be resolved:
 
 Embeddings enable semantic search over function summaries.
 
-- **Input:** Function summaries (falls back to signature if no summary)
-- **Model:** Configurable, default `text-embedding-3-small` (1536 dimensions)
-- **Storage:** Binary format in `.aria/embeddings.bin`, keyed by qualified name; Format TBD
-- **Updates:** Re-embed only functions with changed summaries
+- **Input:** Function signature + summary (falls back to signature only if no summary)
+- **Model:** Configurable, default `nomic-embed-text` via Ollama (768 dimensions)
+- **Storage:** Binary format in `.aria/`:
+  - `embeddings.idx`: Newline-separated qualified names (sorted alphabetically)
+  - `embeddings.bin`: Raw little-endian f32 values, 768 floats per function, in same order as `.idx`
+- **Updates:** Re-embed only functions missing from the store
 - **Query:** `aria search "<query>" --limit N` returns top-k by cosine similarity
 
 ### 11.4 Future Consideration: Index Sharding
