@@ -3,6 +3,7 @@ mod config;
 mod index;
 mod parser;
 mod resolver;
+mod summarizer;
 
 use clap::{Parser, Subcommand};
 

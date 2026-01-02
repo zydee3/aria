@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
 use walkdir::WalkDir;
 
+use crate::config::Config;
 use crate::index::Index;
 use crate::parser::GoParser;
 use crate::resolver::Resolver;
+use crate::summarizer::{Summarizer, SummaryRequest};
 
 pub fn run() -> ExitCode {
     let aria_dir = Path::new(".aria");
@@ -16,11 +19,17 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Load config
+    let config = load_config(aria_dir);
+
     let mut index = Index::new();
     let mut parser = GoParser::new();
     let mut file_count = 0;
     let mut func_count = 0;
     let mut type_count = 0;
+
+    // Store sources for body extraction during summarization
+    let mut sources: HashMap<String, String> = HashMap::new();
 
     // Walk current directory for Go files
     for entry in WalkDir::new(".")
@@ -56,6 +65,10 @@ pub fn run() -> ExitCode {
                 func_count += entry.functions.len();
                 type_count += entry.types.len();
                 file_count += 1;
+                // Store source for summarization
+                if config.features.summaries {
+                    sources.insert(path_str.to_string(), source);
+                }
                 index.files.insert(path_str.to_string(), entry);
             }
             None => {
@@ -68,6 +81,11 @@ pub fn run() -> ExitCode {
     let mut resolver = Resolver::new();
     resolver.build_symbol_table(&index.files);
     resolver.resolve(&mut index);
+
+    // Generate summaries if enabled
+    if config.features.summaries {
+        run_summarization(&config, &mut index, &sources);
+    }
 
     // Count resolved vs unresolved calls for stats
     // Traverse: files -> functions -> calls
@@ -115,6 +133,102 @@ pub fn run() -> ExitCode {
     );
 
     ExitCode::SUCCESS
+}
+
+fn load_config(aria_dir: &Path) -> Config {
+    let config_path = aria_dir.join("config.toml");
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        Config::default()
+    }
+}
+
+fn run_summarization(config: &Config, index: &mut Index, sources: &HashMap<String, String>) {
+    let summarizer = Summarizer::new(config.llm.batch_size, config.llm.parallel);
+
+    // Collect functions that need summarization with their location info
+    let mut requests: Vec<SummaryRequest> = Vec::new();
+    let mut locations: Vec<(String, usize)> = Vec::new(); // (path, func_idx)
+
+    for (path, entry) in index.files.iter() {
+        let Some(source) = sources.get(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = source.lines().collect();
+
+        for (func_idx, func) in entry.functions.iter().enumerate() {
+            // Skip if already has summary
+            if func.summary.is_some() {
+                continue;
+            }
+
+            // Extract function body from source using line numbers
+            let body = extract_body(&lines, func.line_start, func.line_end);
+            if body.is_empty() {
+                continue;
+            }
+
+            let id = requests.len();
+            requests.push(SummaryRequest {
+                id,
+                signature: func.signature.clone(),
+                body,
+            });
+            locations.push((path.clone(), func_idx));
+        }
+    }
+
+    let total = requests.len();
+    if total == 0 {
+        return;
+    }
+
+    println!(
+        "Generating summaries for {} functions (batch={}, parallel={})...",
+        total, config.llm.batch_size, config.llm.parallel
+    );
+
+    // Process all summaries with batching and parallelism
+    let results = summarizer.summarize_batch(requests);
+
+    let mut summary_count = 0;
+    let mut error_count = 0;
+
+    for result in results {
+        let (path, func_idx) = &locations[result.id];
+
+        match result.summary {
+            Ok(summary) => {
+                if let Some(entry) = index.files.get_mut(path) {
+                    if let Some(func) = entry.functions.get_mut(*func_idx) {
+                        func.summary = Some(summary);
+                        summary_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to summarize: {}", e);
+                error_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "Generated {} summaries ({} errors)",
+        summary_count, error_count
+    );
+}
+
+fn extract_body(lines: &[&str], line_start: u32, line_end: u32) -> String {
+    let start = (line_start as usize).saturating_sub(1);
+    let end = (line_end as usize).min(lines.len());
+
+    if start >= end || start >= lines.len() {
+        return String::new();
+    }
+
+    lines[start..end].join("\n")
 }
 
 fn is_hidden(entry: &walkdir::DirEntry) -> bool {

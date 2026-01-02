@@ -25,6 +25,10 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_parallel")]
+    pub parallel: usize,
 }
 
 impl Default for LlmConfig {
@@ -33,6 +37,8 @@ impl Default for LlmConfig {
             provider: default_provider(),
             api_key: None,
             model: default_model(),
+            batch_size: default_batch_size(),
+            parallel: default_parallel(),
         }
     }
 }
@@ -43,6 +49,14 @@ fn default_provider() -> String {
 
 fn default_model() -> String {
     "claude-3-haiku".to_string()
+}
+
+fn default_batch_size() -> usize {
+    10
+}
+
+fn default_parallel() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
