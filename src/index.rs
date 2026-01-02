@@ -47,8 +47,18 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<String>,
     pub scope: Scope,
-    pub calls: Vec<String>,
+    pub calls: Vec<CallSite>,
     pub called_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallSite {
+    /// Resolved qualified name of the called function, or "[unresolved]" if resolution fails
+    pub target: String,
+    /// Original call expression as written in source (e.g., "pkg.Foo", "obj.Method()")
+    pub raw: String,
+    /// 1-indexed line number of the call site
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

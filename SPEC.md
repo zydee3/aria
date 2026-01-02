@@ -180,7 +180,13 @@ Indexes are stored as JSON in `.aria/` at the repository root.
           "summary": "string | null",
           "receiver": "string | null",
           "scope": "string",
-          "calls": ["string"],
+          "calls": [
+            {
+              "target": "string",
+              "raw": "string",
+              "line": "integer"
+            }
+          ],
           "called_by": ["string"]
         }
       ],
@@ -205,6 +211,10 @@ Indexes are stored as JSON in `.aria/` at the repository root.
 - `scope`: One of "public", "static", "internal"
 - `kind`: One of "struct", "interface", "typedef", "enum"
 - `methods`: Qualified names of methods with this receiver/type
+- `calls[].target`: Resolved qualified name of the called function (or `[unresolved]` if resolution fails)
+- `calls[].raw`: Original call expression as written in source (e.g., `pkg.Foo`, `obj.Method()`, `Bar`)
+- `calls[].line`: 1-indexed line number of the call site
+- `called_by`: Qualified names of functions that call this function (populated during resolution)
 
 ### 7.3 Diff-Based Incremental Updates
 

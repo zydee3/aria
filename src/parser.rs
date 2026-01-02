@@ -1,6 +1,6 @@
 use tree_sitter::Parser;
 
-use crate::index::{FileEntry, Function, Scope, TypeDef, TypeKind};
+use crate::index::{CallSite, FileEntry, Function, Scope, TypeDef, TypeKind};
 
 pub struct GoParser {
     parser: Parser,
@@ -101,8 +101,12 @@ impl GoParser {
             Scope::Internal
         };
 
-        // TODO: extract calls
-        let calls = Vec::new();
+        // Extract call sites from function body
+        let calls = if let Some(body) = node.child_by_field_name("body") {
+            self.extract_calls(&body, source)
+        } else {
+            Vec::new()
+        };
 
         Some(Function {
             name,
@@ -148,6 +152,13 @@ impl GoParser {
             Scope::Internal
         };
 
+        // Extract call sites from method body
+        let calls = if let Some(body) = node.child_by_field_name("body") {
+            self.extract_calls(&body, source)
+        } else {
+            Vec::new()
+        };
+
         Some(Function {
             name,
             qualified_name,
@@ -157,7 +168,7 @@ impl GoParser {
             summary: None,
             receiver: Some(receiver_type),
             scope,
-            calls: Vec::new(),
+            calls,
             called_by: Vec::new(),
         })
     }
@@ -263,6 +274,50 @@ impl GoParser {
             methods: Vec::new(), // TODO: populate from method declarations
         })
     }
+
+    /// Extract all call sites from a function/method body
+    fn extract_calls(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<CallSite> {
+        let mut calls = Vec::new();
+        self.collect_calls(node, source, &mut calls);
+        calls
+    }
+
+    /// Recursively collect call_expression nodes
+    fn collect_calls(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        calls: &mut Vec<CallSite>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some(call_site) = self.extract_call_site(node, source) {
+                calls.push(call_site);
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_calls(&child, source, calls);
+        }
+    }
+
+    /// Extract a CallSite from a call_expression node
+    fn extract_call_site(&self, node: &tree_sitter::Node, source: &[u8]) -> Option<CallSite> {
+        // call_expression has 'function' field which is what's being called
+        let func_node = node.child_by_field_name("function")?;
+        let raw = node_text(&func_node, source).to_string();
+
+        let line = node.start_position().row as u32 + 1;
+
+        // Target will be resolved later by the Resolver
+        // For now, we set it to [unresolved]
+        Some(CallSite {
+            target: "[unresolved]".to_string(),
+            raw,
+            line,
+        })
+    }
 }
 
 fn node_text<'a>(node: &tree_sitter::Node, source: &'a [u8]) -> &'a str {
@@ -328,5 +383,65 @@ func (s *Server) Start() error {
         let t = &entry.types[0];
         assert_eq!(t.name, "Server");
         assert_eq!(t.kind, TypeKind::Struct);
+    }
+
+    #[test]
+    fn test_extract_calls() {
+        let source = r#"
+package main
+
+import "fmt"
+
+func greet(name string) {
+    fmt.Println("Hello, " + name)
+}
+
+func main() {
+    greet("world")
+    fmt.Printf("Done\n")
+}
+"#;
+        let mut parser = GoParser::new();
+        let entry = parser.parse_file(source, "main.go").unwrap();
+
+        assert_eq!(entry.functions.len(), 2);
+
+        // greet has one call: fmt.Println
+        let greet = entry.functions.iter().find(|f| f.name == "greet").unwrap();
+        assert_eq!(greet.calls.len(), 1);
+        assert_eq!(greet.calls[0].raw, "fmt.Println");
+        assert_eq!(greet.calls[0].target, "[unresolved]");
+
+        // main has two calls: greet and fmt.Printf
+        let main_fn = entry.functions.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(main_fn.calls.len(), 2);
+        assert_eq!(main_fn.calls[0].raw, "greet");
+        assert_eq!(main_fn.calls[1].raw, "fmt.Printf");
+    }
+
+    #[test]
+    fn test_extract_method_calls() {
+        let source = r#"
+package server
+
+type Server struct {
+    logger Logger
+}
+
+func (s *Server) Start() error {
+    s.logger.Info("starting")
+    s.init()
+    return nil
+}
+
+func (s *Server) init() {}
+"#;
+        let mut parser = GoParser::new();
+        let entry = parser.parse_file(source, "server.go").unwrap();
+
+        let start = entry.functions.iter().find(|f| f.name == "Start").unwrap();
+        assert_eq!(start.calls.len(), 2);
+        assert_eq!(start.calls[0].raw, "s.logger.Info");
+        assert_eq!(start.calls[1].raw, "s.init");
     }
 }

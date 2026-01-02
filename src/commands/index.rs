@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 
 use crate::index::Index;
 use crate::parser::GoParser;
+use crate::resolver::Resolver;
 
 pub fn run() -> ExitCode {
     let aria_dir = Path::new(".aria");
@@ -63,6 +64,27 @@ pub fn run() -> ExitCode {
         }
     }
 
+    // Resolve call targets and populate called_by
+    let mut resolver = Resolver::new();
+    resolver.build_symbol_table(&index.files);
+    resolver.resolve(&mut index);
+
+    // Count resolved vs unresolved calls for stats
+    // Traverse: files -> functions -> calls
+    let mut resolved_count = 0;
+    let mut unresolved_count = 0;
+    for entry in index.files.values() {
+        for func in &entry.functions {
+            for call in &func.calls {
+                if call.target == "[unresolved]" {
+                    unresolved_count += 1;
+                } else {
+                    resolved_count += 1;
+                }
+            }
+        }
+    }
+
     // Get current git commit if available
     index.commit = get_git_head().unwrap_or_default();
 
@@ -80,9 +102,16 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let total_calls = resolved_count + unresolved_count;
+    let resolution_pct = if total_calls > 0 {
+        (resolved_count as f64 / total_calls as f64) * 100.0
+    } else {
+        100.0
+    };
+
     println!(
-        "Indexed {} files: {} functions, {} types",
-        file_count, func_count, type_count
+        "Indexed {} files: {} functions, {} types, {} calls ({:.0}% resolved)",
+        file_count, func_count, type_count, total_calls, resolution_pct
     );
 
     ExitCode::SUCCESS

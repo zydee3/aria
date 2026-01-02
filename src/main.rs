@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod index;
 mod parser;
+mod resolver;
 
 use clap::{Parser, Subcommand};
 
