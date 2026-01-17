@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 
+use crate::externals::ExternalDb;
 use crate::index::{Function, Index};
 
 #[derive(Subcommand)]
@@ -22,6 +23,9 @@ pub enum QueryCommand {
         /// Trace depth
         #[arg(long, default_value = "2")]
         depth: usize,
+        /// Show summaries for each function call
+        #[arg(long, short = 's')]
+        summaries: bool,
     },
 
     /// Find all usages of a symbol (backward edge: what calls this function)
@@ -31,6 +35,9 @@ pub enum QueryCommand {
         /// Maximum depth for caller chain
         #[arg(long, default_value = "1")]
         depth: usize,
+        /// Show summaries for each function call
+        #[arg(long, short = 's')]
+        summaries: bool,
     },
 
     /// Get file overview
@@ -57,8 +64,8 @@ pub fn run(cmd: QueryCommand) -> ExitCode {
 
     match cmd {
         QueryCommand::Function { name } => query_function(&index, &name),
-        QueryCommand::Trace { name, depth } => query_trace(&index, &name, depth),
-        QueryCommand::Usages { name, depth } => query_usages(&index, &name, depth),
+        QueryCommand::Trace { name, depth, summaries } => query_trace(&index, &name, depth, summaries),
+        QueryCommand::Usages { name, depth, summaries } => query_usages(&index, &name, depth, summaries),
         QueryCommand::File { path } => query_file(&index, &path),
         QueryCommand::List { path } => query_list(&index, path.as_deref()),
     }
@@ -148,7 +155,7 @@ fn query_function(index: &Index, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn query_trace(index: &Index, name: &str, max_depth: usize) -> ExitCode {
+fn query_trace(index: &Index, name: &str, max_depth: usize, show_summaries: bool) -> ExitCode {
     let func_map = build_function_map(index);
     let matches = find_functions(index, name);
 
@@ -166,42 +173,70 @@ fn query_trace(index: &Index, name: &str, max_depth: usize) -> ExitCode {
     }
 
     // Print root
-    print_trace_node(file_path, func, "", true);
+    print_trace_node(file_path, func, "", true, show_summaries);
 
     // Recursively print call tree
     let mut visited = HashSet::new();
     visited.insert(func.qualified_name.as_str());
-    print_trace_children(&func_map, func, "", max_depth, 1, &mut visited);
+
+    // Track seen externals so we only show summary on first occurrence
+    let mut seen_externals = HashSet::new();
+    let external_db = if show_summaries { Some(ExternalDb::new()) } else { None };
+
+    print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
 
     ExitCode::SUCCESS
 }
 
-fn print_trace_node(file_path: &str, func: &Function, prefix: &str, is_root: bool) {
-    if is_root {
-        println!(
-            "{} ({}:{}-{})",
-            func.qualified_name, file_path, func.line_start, func.line_end
-        );
+fn print_trace_node(file_path: &str, func: &Function, prefix: &str, is_root: bool, show_summary: bool) {
+    if show_summary {
+        // Compact format with inline summary
+        let summary_part = func.summary.as_ref()
+            .map(|s| format!(" : \"{}\"", s))
+            .unwrap_or_default();
+        if is_root {
+            println!(
+                "{} ({}:{}-{}){}",
+                func.qualified_name, file_path, func.line_start, func.line_end, summary_part
+            );
+        } else {
+            println!(
+                "{}{} ({}:{}-{}){}",
+                prefix, func.qualified_name, file_path, func.line_start, func.line_end, summary_part
+            );
+        }
     } else {
-        println!(
-            "{}{} ({}:{}-{})",
-            prefix, func.qualified_name, file_path, func.line_start, func.line_end
-        );
-    }
+        // Original format with summary on separate line
+        if is_root {
+            println!(
+                "{} ({}:{}-{})",
+                func.qualified_name, file_path, func.line_start, func.line_end
+            );
+        } else {
+            println!(
+                "{}{} ({}:{}-{})",
+                prefix, func.qualified_name, file_path, func.line_start, func.line_end
+            );
+        }
 
-    if let Some(summary) = &func.summary {
-        let summary_prefix = if is_root { "│ " } else { &format!("{}│ ", prefix.replace("├── ", "│   ").replace("└── ", "    ")) };
-        println!("{}{}", summary_prefix, summary);
+        if let Some(summary) = &func.summary {
+            let summary_prefix = if is_root { "│ " } else { &format!("{}│ ", prefix.replace("├── ", "│   ").replace("└── ", "    ")) };
+            println!("{}{}", summary_prefix, summary);
+        }
     }
 }
 
 fn print_trace_children<'a>(
     func_map: &HashMap<&'a str, (&'a str, &'a Function)>,
+    index: &'a Index,
     func: &'a Function,
     prefix: &str,
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<&'a str>,
+    show_summaries: bool,
+    seen_externals: &mut HashSet<String>,
+    external_db: &Option<ExternalDb>,
 ) {
     if current_depth > max_depth {
         return;
@@ -228,19 +263,63 @@ fn print_trace_children<'a>(
                 continue;
             }
 
-            print_trace_node(child_file, child_func, &format!("{}{}", prefix, connector), false);
+            print_trace_node(child_file, child_func, &format!("{}{}", prefix, connector), false, show_summaries);
 
             visited.insert(call.target.as_str());
-            print_trace_children(func_map, child_func, &new_prefix, max_depth, current_depth + 1, visited);
+            print_trace_children(func_map, index, child_func, &new_prefix, max_depth, current_depth + 1, visited, show_summaries, seen_externals, external_db);
             visited.remove(call.target.as_str());
         } else {
             // Resolved but not in index (external)
-            println!("{}{}[external] {}", prefix, connector, call.target);
+            if show_summaries {
+                // Only show summary on first occurrence
+                let first_occurrence = seen_externals.insert(call.target.clone());
+                let summary_suffix = if first_occurrence {
+                    get_external_summary(index, &call.target, external_db.as_ref().unwrap())
+                } else {
+                    String::new()
+                };
+                println!("{}{}[external] {}{}", prefix, connector, call.target, summary_suffix);
+            } else {
+                println!("{}{}[external] {}", prefix, connector, call.target);
+            }
         }
     }
 }
 
-fn query_usages(index: &Index, name: &str, max_depth: usize) -> ExitCode {
+/// Get summary for an external call, checking index.externals first, then ExternalDb
+/// Target is already formatted as "[kind:name]", so we just return ` : "summary"` or empty
+fn get_external_summary(index: &Index, target: &str, external_db: &ExternalDb) -> String {
+    // First check if we have it in index.externals
+    if let Some(ext) = index.externals.get(target) {
+        if let Some(summary) = &ext.summary {
+            return format!(" : \"{}\"", summary);
+        }
+    }
+
+    // Extract the function name - handle "[kind:name]" format
+    let func_name = if target.starts_with('[') && target.contains(':') {
+        // Format is [kind:name], extract name
+        target.trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(':')
+            .nth(1)
+            .unwrap_or(target)
+    } else {
+        // Plain name or qualified name like "pkg.Func"
+        target.rsplit('.').next().unwrap_or(target)
+    };
+
+    // Try to categorize via ExternalDb (handles syscalls, libc, macros)
+    let (_, summary) = external_db.categorize(func_name);
+
+    if let Some(s) = summary {
+        format!(" : \"{}\"", s)
+    } else {
+        String::new()
+    }
+}
+
+fn query_usages(index: &Index, name: &str, max_depth: usize, show_summaries: bool) -> ExitCode {
     let func_map = build_function_map(index);
     let matches = find_functions(index, name);
 
@@ -256,10 +335,21 @@ fn query_usages(index: &Index, name: &str, max_depth: usize) -> ExitCode {
         eprintln!();
     }
 
-    println!(
-        "{} ({}:{}-{})",
-        func.qualified_name, file_path, func.line_start, func.line_end
-    );
+    // Print root with optional summary
+    if show_summaries {
+        let summary_part = func.summary.as_ref()
+            .map(|s| format!(" : \"{}\"", s))
+            .unwrap_or_default();
+        println!(
+            "{} ({}:{}-{}){}",
+            func.qualified_name, file_path, func.line_start, func.line_end, summary_part
+        );
+    } else {
+        println!(
+            "{} ({}:{}-{})",
+            func.qualified_name, file_path, func.line_start, func.line_end
+        );
+    }
 
     if func.called_by.is_empty() {
         println!("  (no callers found)");
@@ -269,7 +359,7 @@ fn query_usages(index: &Index, name: &str, max_depth: usize) -> ExitCode {
     // Print caller tree (reverse of trace)
     let mut visited = HashSet::new();
     visited.insert(func.qualified_name.as_str());
-    print_usages_callers(&func_map, func, "", max_depth, 1, &mut visited);
+    print_usages_callers(&func_map, func, "", max_depth, 1, &mut visited, show_summaries);
 
     ExitCode::SUCCESS
 }
@@ -281,6 +371,7 @@ fn print_usages_callers<'a>(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<&'a str>,
+    show_summaries: bool,
 ) {
     if current_depth > max_depth {
         return;
@@ -301,13 +392,25 @@ fn print_usages_callers<'a>(
                 continue;
             }
 
-            println!(
-                "{}{}{} ({}:{}-{})",
-                prefix, connector, caller_func.qualified_name, caller_file, caller_func.line_start, caller_func.line_end
-            );
+            if show_summaries {
+                let summary_part = caller_func.summary.as_ref()
+                    .map(|s| format!(" : \"{}\"", s))
+                    .unwrap_or_default();
+                println!(
+                    "{}{}{} ({}:{}-{}){}",
+                    prefix, connector, caller_func.qualified_name, caller_file,
+                    caller_func.line_start, caller_func.line_end, summary_part
+                );
+            } else {
+                println!(
+                    "{}{}{} ({}:{}-{})",
+                    prefix, connector, caller_func.qualified_name, caller_file,
+                    caller_func.line_start, caller_func.line_end
+                );
+            }
 
             visited.insert(caller_name.as_str());
-            print_usages_callers(func_map, caller_func, &new_prefix, max_depth, current_depth + 1, visited);
+            print_usages_callers(func_map, caller_func, &new_prefix, max_depth, current_depth + 1, visited, show_summaries);
             visited.remove(caller_name.as_str());
         } else {
             println!("{}{}[external] {}", prefix, connector, caller_name);
