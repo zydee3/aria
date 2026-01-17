@@ -26,6 +26,38 @@ aria query list                 # List all functions
 aria search "natural language"  # Semantic search (requires: aria embed)
 ```
 
+## Trace Flags
+
+```bash
+aria query trace <name> [OPTIONS]
+  -d, --depth <N>  # Trace depth (default: 2, use 0 for unlimited)
+  -s, --summaries  # Show function summaries inline
+  -c, --callers    # Show caller chain from root to target function
+```
+
+Output format uses level numbers and dashes to show call depth:
+```
+[0] main (./main.c:10-50)
+[1] - process (./proc.c:20-80)
+[2] -- handler (./handler.c:5-30)
+[3] --- [external] [libc:malloc]
+```
+
+With `-s`, summaries appear inline:
+```
+[0] main (./main.c:10-50) : "Entry point for the application"
+[1] - process (./proc.c:20-80) : "Processes incoming requests"
+```
+
+With `-c`, shows the full call path from root to your target, then forward calls:
+```
+[0] main (./main.c:10-50)
+[1] - caller1 (./a.c:1-10)
+[2] -- caller2 (./b.c:1-10)
+[3] --- targetFunction (./target.c:5-20)
+[4] ---- childCall (./child.c:1-5)
+```
+
 ## Examples
 
 ```bash
@@ -34,6 +66,9 @@ aria query function HandleRequest
 
 # Trace what main() calls, 3 levels deep
 aria query trace main --depth 3
+
+# Trace with full context: callers + callees + summaries
+aria query trace myFunction -c -s --depth 3
 
 # Find all callers of a function
 aria query usages Validate

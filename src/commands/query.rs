@@ -20,8 +20,8 @@ pub enum QueryCommand {
     Trace {
         /// Qualified function name
         name: String,
-        /// Trace depth
-        #[arg(long, default_value = "2")]
+        /// Trace depth (0 = unlimited, default: 2)
+        #[arg(long, short = 'd', default_value = "2")]
         depth: usize,
         /// Show summaries for each function call
         #[arg(long, short = 's')]
@@ -35,8 +35,8 @@ pub enum QueryCommand {
     Usages {
         /// Symbol name
         name: String,
-        /// Maximum depth for caller chain
-        #[arg(long, default_value = "1")]
+        /// Maximum depth for caller chain (0 = unlimited, default: 1)
+        #[arg(long, short = 'd', default_value = "1")]
         depth: usize,
         /// Show summaries for each function call
         #[arg(long, short = 's')]
@@ -67,8 +67,14 @@ pub fn run(cmd: QueryCommand) -> ExitCode {
 
     match cmd {
         QueryCommand::Function { name } => query_function(&index, &name),
-        QueryCommand::Trace { name, depth, summaries, callers } => query_trace(&index, &name, depth, summaries, callers),
-        QueryCommand::Usages { name, depth, summaries } => query_usages(&index, &name, depth, summaries),
+        QueryCommand::Trace { name, depth, summaries, callers } => {
+            let max_depth = if depth == 0 { usize::MAX } else { depth };
+            query_trace(&index, &name, max_depth, summaries, callers)
+        }
+        QueryCommand::Usages { name, depth, summaries } => {
+            let max_depth = if depth == 0 { usize::MAX } else { depth };
+            query_usages(&index, &name, max_depth, summaries)
+        }
         QueryCommand::File { path } => query_file(&index, &path),
         QueryCommand::List { path } => query_list(&index, path.as_deref()),
     }
