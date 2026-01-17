@@ -182,71 +182,50 @@ fn query_trace(index: &Index, name: &str, max_depth: usize, show_summaries: bool
     // If showing callers, build and print the caller chain first
     if show_callers {
         let caller_chain = build_caller_chain(&func_map, func);
+        let target_level = caller_chain.len();
+
         if !caller_chain.is_empty() {
             // Print callers from root down to parent of target
             for (i, (caller_file, caller_func)) in caller_chain.iter().enumerate() {
-                let indent = "  ".repeat(i);
-                print_caller_chain_node(caller_file, caller_func, &indent, show_summaries);
+                print_level_node(i, caller_file, caller_func, show_summaries);
             }
-            // Print arrow to show the target function
-            let target_indent = "  ".repeat(caller_chain.len());
-            println!("{}└─▶ {} ({}:{}-{}){}",
-                target_indent,
-                func.qualified_name,
-                file_path,
-                func.line_start,
-                func.line_end,
-                if show_summaries {
-                    func.summary.as_ref().map(|s| format!(" : \"{}\"", s)).unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            );
-            // Print forward edges with additional indent
-            let mut visited = HashSet::new();
-            visited.insert(func.qualified_name.as_str());
-            let forward_prefix = format!("{}    ", target_indent);
-            print_trace_children(&func_map, index, func, &forward_prefix, max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
         } else {
-            // No callers - this is a root function, print normally
             println!("[root]");
-            print_trace_node(file_path, func, "", true, show_summaries);
-            let mut visited = HashSet::new();
-            visited.insert(func.qualified_name.as_str());
-            print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
         }
-    } else {
-        // Original behavior - just print forward trace
-        print_trace_node(file_path, func, "", true, show_summaries);
+
+        // Print target function
+        print_level_node(target_level, file_path, func, show_summaries);
+
+        // Print forward edges
         let mut visited = HashSet::new();
         visited.insert(func.qualified_name.as_str());
-        print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+        print_trace_level(&func_map, index, func, target_level + 1, max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+    } else {
+        // Original behavior - just print forward trace with levels
+        print_level_node(0, file_path, func, show_summaries);
+        let mut visited = HashSet::new();
+        visited.insert(func.qualified_name.as_str());
+        print_trace_level(&func_map, index, func, 1, max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
     }
 
     ExitCode::SUCCESS
 }
 
 /// Build caller chain from root to the target function's parent
-/// Returns vec of (file_path, function) from root down to immediate caller
 fn build_caller_chain<'a>(
     func_map: &HashMap<&'a str, (&'a str, &'a Function)>,
     target: &'a Function,
 ) -> Vec<(&'a str, &'a Function)> {
-    // Find path from any root to the target using BFS
-    // We want the shortest path from a root (function with no callers) to target's caller
-
     if target.called_by.is_empty() {
-        return Vec::new(); // Target is a root
+        return Vec::new();
     }
 
-    // Work backwards: find a path from target to a root, then reverse
     let mut chain = Vec::new();
     let mut current = target;
     let mut visited = HashSet::new();
     visited.insert(target.qualified_name.as_str());
 
     while !current.called_by.is_empty() {
-        // Pick first caller that we haven't visited
         let caller_name = current.called_by.iter()
             .find(|name| !visited.contains(name.as_str()));
 
@@ -257,10 +236,10 @@ fn build_caller_chain<'a>(
                     chain.push((*file, *caller_func));
                     current = caller_func;
                 } else {
-                    break; // External caller, stop here
+                    break;
                 }
             }
-            None => break, // All callers visited (cycle), stop
+            None => break,
         }
     }
 
@@ -268,66 +247,43 @@ fn build_caller_chain<'a>(
     chain
 }
 
-/// Print a node in the caller chain (going down toward target)
-fn print_caller_chain_node(file_path: &str, func: &Function, indent: &str, show_summary: bool) {
+/// Print a caller chain node: [N] --- name (file:line)
+fn print_level_node(level: usize, file_path: &str, func: &Function, show_summary: bool) {
+    let dashes = "-".repeat(level);
     let summary_part = if show_summary {
         func.summary.as_ref().map(|s| format!(" : \"{}\"", s)).unwrap_or_default()
     } else {
         String::new()
     };
-    println!("{}{} ({}:{}-{}){}",
-        indent,
-        func.qualified_name,
-        file_path,
-        func.line_start,
-        func.line_end,
-        summary_part
-    );
-}
-
-fn print_trace_node(file_path: &str, func: &Function, prefix: &str, is_root: bool, show_summary: bool) {
-    if show_summary {
-        // Compact format with inline summary
-        let summary_part = func.summary.as_ref()
-            .map(|s| format!(" : \"{}\"", s))
-            .unwrap_or_default();
-        if is_root {
-            println!(
-                "{} ({}:{}-{}){}",
-                func.qualified_name, file_path, func.line_start, func.line_end, summary_part
-            );
-        } else {
-            println!(
-                "{}{} ({}:{}-{}){}",
-                prefix, func.qualified_name, file_path, func.line_start, func.line_end, summary_part
-            );
-        }
+    if level == 0 {
+        println!("[{}] {} ({}:{}-{}){}",
+            level,
+            func.qualified_name,
+            file_path,
+            func.line_start,
+            func.line_end,
+            summary_part
+        );
     } else {
-        // Original format with summary on separate line
-        if is_root {
-            println!(
-                "{} ({}:{}-{})",
-                func.qualified_name, file_path, func.line_start, func.line_end
-            );
-        } else {
-            println!(
-                "{}{} ({}:{}-{})",
-                prefix, func.qualified_name, file_path, func.line_start, func.line_end
-            );
-        }
-
-        if let Some(summary) = &func.summary {
-            let summary_prefix = if is_root { "│ " } else { &format!("{}│ ", prefix.replace("├── ", "│   ").replace("└── ", "    ")) };
-            println!("{}{}", summary_prefix, summary);
-        }
+        println!("[{}] {} {} ({}:{}-{}){}",
+            level,
+            dashes,
+            func.qualified_name,
+            file_path,
+            func.line_start,
+            func.line_end,
+            summary_part
+        );
     }
 }
 
-fn print_trace_children<'a>(
+
+/// Print trace children using level-based format
+fn print_trace_level<'a>(
     func_map: &HashMap<&'a str, (&'a str, &'a Function)>,
     index: &'a Index,
     func: &'a Function,
-    prefix: &str,
+    level: usize,
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<&'a str>,
@@ -339,45 +295,50 @@ fn print_trace_children<'a>(
         return;
     }
 
-    let calls: Vec<_> = func.calls.iter().collect();
-    let total = calls.len();
+    let dashes = "-".repeat(level);
 
-    for (i, call) in calls.iter().enumerate() {
-        let is_last = i == total - 1;
-        let connector = if is_last { "└── " } else { "├── " };
-        let child_prefix = if is_last { "    " } else { "│   " };
-        let new_prefix = format!("{}{}", prefix, child_prefix);
-
+    for call in &func.calls {
         if call.target == "[unresolved]" {
-            println!("{}{}[unresolved] {}", prefix, connector, call.raw);
+            println!("[{}] {} [unresolved] {}", level, dashes, call.raw);
             continue;
         }
 
         if let Some((child_file, child_func)) = func_map.get(call.target.as_str()) {
-            // Check for cycles
             if visited.contains(call.target.as_str()) {
-                println!("{}{}[cycle] {}", prefix, connector, call.target);
+                println!("[{}] {} [cycle] {}", level, dashes, call.target);
                 continue;
             }
 
-            print_trace_node(child_file, child_func, &format!("{}{}", prefix, connector), false, show_summaries);
+            let summary_part = if show_summaries {
+                child_func.summary.as_ref().map(|s| format!(" : \"{}\"", s)).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            println!("[{}] {} {} ({}:{}-{}){}",
+                level,
+                dashes,
+                child_func.qualified_name,
+                child_file,
+                child_func.line_start,
+                child_func.line_end,
+                summary_part
+            );
 
             visited.insert(call.target.as_str());
-            print_trace_children(func_map, index, child_func, &new_prefix, max_depth, current_depth + 1, visited, show_summaries, seen_externals, external_db);
+            print_trace_level(func_map, index, child_func, level + 1, max_depth, current_depth + 1, visited, show_summaries, seen_externals, external_db);
             visited.remove(call.target.as_str());
         } else {
-            // Resolved but not in index (external)
+            // External
             if show_summaries {
-                // Only show summary on first occurrence
                 let first_occurrence = seen_externals.insert(call.target.clone());
                 let summary_suffix = if first_occurrence {
                     get_external_summary(index, &call.target, external_db.as_ref().unwrap())
                 } else {
                     String::new()
                 };
-                println!("{}{}[external] {}{}", prefix, connector, call.target, summary_suffix);
+                println!("[{}] {} [external] {}{}", level, dashes, call.target, summary_suffix);
             } else {
-                println!("{}{}[external] {}", prefix, connector, call.target);
+                println!("[{}] {} [external] {}", level, dashes, call.target);
             }
         }
     }
