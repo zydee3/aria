@@ -2,11 +2,12 @@ use tree_sitter::Parser;
 
 use crate::index::{CallSite, FileEntry, Function, Scope, TypeDef, TypeKind};
 
-// Re-export language enum for indexer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Language {
     Go,
     Rust,
+    C,
 }
 
 pub struct GoParser {
@@ -824,6 +825,352 @@ fn rust_path_to_module(path: &str) -> String {
     path.replace('/', "::")
 }
 
+// ============================================================================
+// C Parser
+// ============================================================================
+
+pub struct CParser {
+    parser: Parser,
+}
+
+impl CParser {
+    pub fn new() -> Self {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .expect("failed to load C grammar");
+        Self { parser }
+    }
+
+    pub fn parse_file(&mut self, source: &str, path: &str) -> Option<FileEntry> {
+        let tree = self.parser.parse(source, None)?;
+        let root = tree.root_node();
+
+        let mut functions = Vec::new();
+        let mut types = Vec::new();
+
+        // Use file path as prefix for qualified names (C has no module/package system)
+        // e.g., "src/auth/login.c" -> "src/auth/login"
+        let path_prefix = c_path_to_prefix(path);
+
+        // Walk top-level declarations
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            match child.kind() {
+                "function_definition" => {
+                    if let Some(func) = self.extract_function(&child, source.as_bytes(), &path_prefix) {
+                        functions.push(func);
+                    }
+                }
+                "struct_specifier" => {
+                    if let Some(t) = self.extract_struct(&child, source.as_bytes(), &path_prefix) {
+                        types.push(t);
+                    }
+                }
+                "enum_specifier" => {
+                    if let Some(t) = self.extract_enum(&child, source.as_bytes(), &path_prefix) {
+                        types.push(t);
+                    }
+                }
+                "type_definition" => {
+                    if let Some(t) = self.extract_typedef(&child, source.as_bytes(), &path_prefix) {
+                        types.push(t);
+                    }
+                }
+                "declaration" => {
+                    // Check for struct/enum inside declaration
+                    self.extract_types_from_declaration(&child, source.as_bytes(), &path_prefix, &mut types);
+                }
+                _ => {}
+            }
+        }
+
+        let ast_hash = format!("{:016x}", hash_bytes(source.as_bytes()));
+
+        Some(FileEntry {
+            ast_hash,
+            functions,
+            types,
+        })
+    }
+
+    fn extract_function(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        path_prefix: &str,
+    ) -> Option<Function> {
+        // function_definition has declarator field which contains the function name
+        let declarator = node.child_by_field_name("declarator")?;
+        let name = self.extract_declarator_name(&declarator, source)?;
+
+        // Build qualified name using file path as prefix
+        // Use "." separator for consistency with resolver (Go-style)
+        let qualified_name = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}.{}", path_prefix, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        // Build signature from return type + declarator
+        let signature = self.build_c_signature(node, source);
+
+        // Determine scope: static = Internal (file-local), otherwise Public (external linkage)
+        let scope = self.extract_c_scope(node, source);
+
+        // Extract call sites from function body
+        let calls = if let Some(body) = node.child_by_field_name("body") {
+            self.extract_calls(&body, source)
+        } else {
+            Vec::new()
+        };
+
+        // Compute AST hash
+        let func_source = &source[node.start_byte()..node.end_byte()];
+        let ast_hash = format!("{:016x}", hash_bytes(func_source));
+
+        Some(Function {
+            name,
+            qualified_name,
+            ast_hash,
+            line_start,
+            line_end,
+            signature,
+            summary: None,
+            receiver: None,
+            scope,
+            calls,
+            called_by: Vec::new(),
+        })
+    }
+
+    fn extract_declarator_name(&self, declarator: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+        // Handle function_declarator which wraps the identifier
+        match declarator.kind() {
+            "function_declarator" => {
+                // function_declarator has 'declarator' field which is typically an identifier
+                let inner = declarator.child_by_field_name("declarator")?;
+                self.extract_declarator_name(&inner, source)
+            }
+            "pointer_declarator" => {
+                // pointer_declarator has 'declarator' field
+                let inner = declarator.child_by_field_name("declarator")?;
+                self.extract_declarator_name(&inner, source)
+            }
+            "identifier" => Some(node_text(declarator, source).to_string()),
+            _ => {
+                // Try to find an identifier child
+                let mut cursor = declarator.walk();
+                for child in declarator.children(&mut cursor) {
+                    if child.kind() == "identifier" {
+                        return Some(node_text(&child, source).to_string());
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn build_c_signature(&self, node: &tree_sitter::Node, source: &[u8]) -> String {
+        // Get return type from 'type' field
+        let return_type = node
+            .child_by_field_name("type")
+            .map(|n| node_text(&n, source).to_string())
+            .unwrap_or_default();
+
+        // Get the full declarator (includes name and parameters)
+        let declarator = node
+            .child_by_field_name("declarator")
+            .map(|n| node_text(&n, source).to_string())
+            .unwrap_or_default();
+
+        if return_type.is_empty() {
+            declarator
+        } else {
+            format!("{} {}", return_type, declarator)
+        }
+    }
+
+    fn extract_c_scope(&self, node: &tree_sitter::Node, source: &[u8]) -> Scope {
+        // Check for storage_class_specifier with "static"
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "storage_class_specifier" {
+                let text = node_text(&child, source);
+                if text == "static" {
+                    return Scope::Internal;
+                }
+            }
+        }
+        // Default: external linkage = Public
+        Scope::Public
+    }
+
+    fn extract_struct(&self, node: &tree_sitter::Node, source: &[u8], path_prefix: &str) -> Option<TypeDef> {
+        // struct_specifier has optional 'name' field
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        let qualified_name = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}.{}", path_prefix, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Struct,
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_enum(&self, node: &tree_sitter::Node, source: &[u8], path_prefix: &str) -> Option<TypeDef> {
+        // enum_specifier has optional 'name' field
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        let qualified_name = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}.{}", path_prefix, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Enum,
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_typedef(&self, node: &tree_sitter::Node, source: &[u8], path_prefix: &str) -> Option<TypeDef> {
+        // type_definition: typedef <type> <name>
+        // The name is a type_identifier child (not a field)
+        let mut cursor = node.walk();
+        let mut name = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_identifier" {
+                name = Some(node_text(&child, source).to_string());
+                break;
+            }
+        }
+        let name = name?;
+
+        let qualified_name = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}.{}", path_prefix, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Typedef,
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_types_from_declaration(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        path_prefix: &str,
+        types: &mut Vec<TypeDef>,
+    ) {
+        // Declarations may contain struct/enum definitions
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "struct_specifier" => {
+                    if let Some(t) = self.extract_struct(&child, source, path_prefix) {
+                        types.push(t);
+                    }
+                }
+                "enum_specifier" => {
+                    if let Some(t) = self.extract_enum(&child, source, path_prefix) {
+                        types.push(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn extract_calls(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<CallSite> {
+        let mut calls = Vec::new();
+        self.collect_calls(node, source, &mut calls);
+        calls
+    }
+
+    fn collect_calls(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        calls: &mut Vec<CallSite>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some(call_site) = self.extract_call_site(node, source) {
+                calls.push(call_site);
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_calls(&child, source, calls);
+        }
+    }
+
+    fn extract_call_site(&self, node: &tree_sitter::Node, source: &[u8]) -> Option<CallSite> {
+        // call_expression has 'function' field
+        let func_node = node.child_by_field_name("function")?;
+        let raw = node_text(&func_node, source).to_string();
+
+        let line = node.start_position().row as u32 + 1;
+
+        Some(CallSite {
+            target: "[unresolved]".to_string(),
+            raw,
+            line,
+        })
+    }
+}
+
+/// Convert C file path to a prefix for qualified names.
+/// e.g., "src/auth/login.c" -> "src/auth/login"
+/// e.g., "./include/utils.h" -> "include/utils"
+fn c_path_to_prefix(path: &str) -> String {
+    // Remove leading "./"
+    let path = path.strip_prefix("./").unwrap_or(path);
+
+    // Remove .c or .h extension
+    let path = path.strip_suffix(".c").or_else(|| path.strip_suffix(".h")).unwrap_or(path);
+
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,5 +1407,135 @@ pub trait Handler {
         assert_eq!(rust_path_to_module("src/commands/index.rs"), "commands::index");
         assert_eq!(rust_path_to_module("./src/foo/bar.rs"), "foo::bar");
         assert_eq!(rust_path_to_module("src/utils/mod.rs"), "utils");
+    }
+
+    // ========================================================================
+    // C Parser Tests
+    // ========================================================================
+
+    #[test]
+    fn test_c_parse_simple_function() {
+        let source = r#"
+int add(int a, int b) {
+    return a + b;
+}
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "src/math.c").unwrap();
+
+        assert_eq!(entry.functions.len(), 1);
+        let f = &entry.functions[0];
+        assert_eq!(f.name, "add");
+        assert_eq!(f.qualified_name, "src/math.add");
+        assert_eq!(f.scope, Scope::Public);
+        assert!(f.signature.contains("int"));
+        assert!(f.signature.contains("add"));
+    }
+
+    #[test]
+    fn test_c_parse_static_function() {
+        let source = r#"
+static void helper(void) {
+    // internal helper
+}
+
+void public_func(void) {
+    helper();
+}
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "utils.c").unwrap();
+
+        assert_eq!(entry.functions.len(), 2);
+
+        let helper = entry.functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper.scope, Scope::Internal);
+
+        let public_fn = entry.functions.iter().find(|f| f.name == "public_func").unwrap();
+        assert_eq!(public_fn.scope, Scope::Public);
+    }
+
+    #[test]
+    fn test_c_parse_struct() {
+        let source = r#"
+struct Point {
+    int x;
+    int y;
+};
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "src/types.h").unwrap();
+
+        assert_eq!(entry.types.len(), 1);
+        let t = &entry.types[0];
+        assert_eq!(t.name, "Point");
+        assert_eq!(t.qualified_name, "src/types.Point");
+        assert_eq!(t.kind, TypeKind::Struct);
+    }
+
+    #[test]
+    fn test_c_parse_enum() {
+        let source = r#"
+enum Status {
+    ACTIVE,
+    INACTIVE,
+    PENDING
+};
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "status.h").unwrap();
+
+        assert_eq!(entry.types.len(), 1);
+        let t = &entry.types[0];
+        assert_eq!(t.name, "Status");
+        assert_eq!(t.kind, TypeKind::Enum);
+    }
+
+    #[test]
+    fn test_c_parse_typedef() {
+        let source = r#"
+typedef unsigned int uint32;
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "types.h").unwrap();
+
+        assert_eq!(entry.types.len(), 1);
+        let t = &entry.types[0];
+        assert_eq!(t.name, "uint32");
+        assert_eq!(t.kind, TypeKind::Typedef);
+    }
+
+    #[test]
+    fn test_c_extract_calls() {
+        let source = r#"
+void greet(const char* name) {
+    printf("Hello, %s\n", name);
+}
+
+int main(void) {
+    greet("world");
+    return 0;
+}
+"#;
+        let mut parser = CParser::new();
+        let entry = parser.parse_file(source, "main.c").unwrap();
+
+        assert_eq!(entry.functions.len(), 2);
+
+        let greet = entry.functions.iter().find(|f| f.name == "greet").unwrap();
+        assert_eq!(greet.calls.len(), 1);
+        assert_eq!(greet.calls[0].raw, "printf");
+
+        let main_fn = entry.functions.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(main_fn.calls.len(), 1);
+        assert_eq!(main_fn.calls[0].raw, "greet");
+    }
+
+    #[test]
+    fn test_c_path_to_prefix() {
+        assert_eq!(c_path_to_prefix("main.c"), "main");
+        assert_eq!(c_path_to_prefix("src/utils.c"), "src/utils");
+        assert_eq!(c_path_to_prefix("./include/types.h"), "include/types");
+        assert_eq!(c_path_to_prefix("src/auth/login.c"), "src/auth/login");
     }
 }

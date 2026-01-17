@@ -101,6 +101,7 @@ impl EmbeddingStore {
     }
 
     /// Get embedding for a qualified name
+    #[allow(dead_code)]
     pub fn get(&self, qualified_name: &str) -> Option<&Vec<f32>> {
         self.embeddings.get(qualified_name)
     }
@@ -138,6 +139,7 @@ impl Default for EmbeddingStore {
 }
 
 /// Remove embeddings for functions that no longer exist
+#[allow(dead_code)]
 pub fn prune_embeddings(aria_dir: &Path, valid_names: &std::collections::HashSet<String>) -> std::io::Result<usize> {
     let mut store = EmbeddingStore::load(aria_dir)?;
     let before = store.len();

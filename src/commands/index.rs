@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::index::Index;
-use crate::parser::{GoParser, RustParser};
+use crate::parser::{CParser, GoParser, RustParser};
 use crate::resolver::Resolver;
 use crate::summarizer::{Summarizer, SummaryRequest};
 use crate::topo;
@@ -30,6 +30,7 @@ pub fn run() -> ExitCode {
     let mut index = Index::new();
     let mut go_parser = GoParser::new();
     let mut rust_parser = RustParser::new();
+    let mut c_parser = CParser::new();
     let mut file_count = 0;
     let mut func_count = 0;
     let mut type_count = 0;
@@ -50,6 +51,7 @@ pub fn run() -> ExitCode {
         let lang = match ext {
             Some("go") => "go",
             Some("rs") => "rust",
+            Some("c") | Some("h") => "c",
             _ => continue,
         };
 
@@ -71,6 +73,7 @@ pub fn run() -> ExitCode {
         let parsed = match lang {
             "go" => go_parser.parse_file(&source, &path_str),
             "rust" => rust_parser.parse_file(&source, &path_str),
+            "c" => c_parser.parse_file(&source, &path_str),
             _ => None,
         };
 
