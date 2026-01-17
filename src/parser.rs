@@ -2,6 +2,13 @@ use tree_sitter::Parser;
 
 use crate::index::{CallSite, FileEntry, Function, Scope, TypeDef, TypeKind};
 
+// Re-export language enum for indexer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Go,
+    Rust,
+}
+
 pub struct GoParser {
     parser: Parser,
 }
@@ -404,6 +411,419 @@ fn hash_bytes(input: &[u8]) -> u64 {
     hasher.finish()
 }
 
+// ============================================================================
+// Rust Parser
+// ============================================================================
+
+pub struct RustParser {
+    parser: Parser,
+}
+
+impl RustParser {
+    pub fn new() -> Self {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("failed to load Rust grammar");
+        Self { parser }
+    }
+
+    pub fn parse_file(&mut self, source: &str, path: &str) -> Option<FileEntry> {
+        let tree = self.parser.parse(source, None)?;
+        let root = tree.root_node();
+
+        let mut functions = Vec::new();
+        let mut types = Vec::new();
+
+        // Use module path from file location for qualified names
+        // e.g., "src/parser.rs" -> "parser", "src/commands/index.rs" -> "commands::index"
+        let module_path = rust_path_to_module(path);
+
+        // Walk top-level declarations
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            match child.kind() {
+                "function_item" => {
+                    if let Some(func) = self.extract_function(&child, source.as_bytes(), &module_path, None) {
+                        functions.push(func);
+                    }
+                }
+                "impl_item" => {
+                    self.extract_impl_functions(&child, source.as_bytes(), &module_path, &mut functions);
+                }
+                "struct_item" => {
+                    if let Some(t) = self.extract_struct(&child, source.as_bytes(), &module_path) {
+                        types.push(t);
+                    }
+                }
+                "enum_item" => {
+                    if let Some(t) = self.extract_enum(&child, source.as_bytes(), &module_path) {
+                        types.push(t);
+                    }
+                }
+                "trait_item" => {
+                    if let Some(t) = self.extract_trait(&child, source.as_bytes(), &module_path) {
+                        types.push(t);
+                    }
+                }
+                "mod_item" => {
+                    // Handle inline modules: mod foo { ... }
+                    self.extract_mod_contents(&child, source.as_bytes(), &module_path, &mut functions, &mut types);
+                }
+                _ => {}
+            }
+        }
+
+        let ast_hash = format!("{:016x}", hash_bytes(source.as_bytes()));
+
+        Some(FileEntry {
+            ast_hash,
+            functions,
+            types,
+        })
+    }
+
+    fn extract_function(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        module_path: &str,
+        impl_type: Option<&str>,
+    ) -> Option<Function> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        // Build qualified name
+        let qualified_name = match impl_type {
+            Some(t) => {
+                if module_path.is_empty() {
+                    format!("{}::{}", t, name)
+                } else {
+                    format!("{}::{}::{}", module_path, t, name)
+                }
+            }
+            None => {
+                if module_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", module_path, name)
+                }
+            }
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        // Build signature
+        let signature = self.build_rust_signature(node, source, &name);
+
+        // Determine visibility
+        let scope = self.extract_visibility(node);
+
+        // Extract call sites from function body
+        let calls = if let Some(body) = node.child_by_field_name("body") {
+            self.extract_calls(&body, source)
+        } else {
+            Vec::new()
+        };
+
+        // Compute AST hash
+        let func_source = &source[node.start_byte()..node.end_byte()];
+        let ast_hash = format!("{:016x}", hash_bytes(func_source));
+
+        Some(Function {
+            name,
+            qualified_name,
+            ast_hash,
+            line_start,
+            line_end,
+            signature,
+            summary: None,
+            receiver: impl_type.map(String::from),
+            scope,
+            calls,
+            called_by: Vec::new(),
+        })
+    }
+
+    fn extract_impl_functions(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        module_path: &str,
+        functions: &mut Vec<Function>,
+    ) {
+        // Get the type being implemented
+        let impl_type = node
+            .child_by_field_name("type")
+            .map(|n| node_text(&n, source).to_string())
+            .unwrap_or_default();
+
+        // Strip pointer/reference from type if present (e.g., "&mut Foo" -> "Foo")
+        let impl_type = impl_type
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim()
+            .to_string();
+
+        // Find the body (declaration_list)
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if child.kind() == "function_item" {
+                if let Some(func) = self.extract_function(&child, source, module_path, Some(&impl_type)) {
+                    functions.push(func);
+                }
+            }
+        }
+    }
+
+    fn extract_struct(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        module_path: &str,
+    ) -> Option<TypeDef> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        let qualified_name = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Struct,
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_enum(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        module_path: &str,
+    ) -> Option<TypeDef> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        let qualified_name = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Enum,
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_trait(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        module_path: &str,
+    ) -> Option<TypeDef> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = node_text(&name_node, source).to_string();
+
+        let qualified_name = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+
+        let line_start = node.start_position().row as u32 + 1;
+        let line_end = node.end_position().row as u32 + 1;
+
+        Some(TypeDef {
+            name,
+            qualified_name,
+            kind: TypeKind::Interface, // Trait is closest to Interface
+            line_start,
+            line_end,
+            summary: None,
+            methods: Vec::new(),
+        })
+    }
+
+    fn extract_mod_contents(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        parent_module: &str,
+        functions: &mut Vec<Function>,
+        types: &mut Vec<TypeDef>,
+    ) {
+        // Get module name
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let mod_name = node_text(&name_node, source);
+
+        // Build nested module path
+        let nested_path = if parent_module.is_empty() {
+            mod_name.to_string()
+        } else {
+            format!("{}::{}", parent_module, mod_name)
+        };
+
+        // Find the body (declaration_list)
+        let Some(body) = node.child_by_field_name("body") else {
+            return; // External mod declaration (mod foo;)
+        };
+
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            match child.kind() {
+                "function_item" => {
+                    if let Some(func) = self.extract_function(&child, source, &nested_path, None) {
+                        functions.push(func);
+                    }
+                }
+                "impl_item" => {
+                    self.extract_impl_functions(&child, source, &nested_path, functions);
+                }
+                "struct_item" => {
+                    if let Some(t) = self.extract_struct(&child, source, &nested_path) {
+                        types.push(t);
+                    }
+                }
+                "enum_item" => {
+                    if let Some(t) = self.extract_enum(&child, source, &nested_path) {
+                        types.push(t);
+                    }
+                }
+                "trait_item" => {
+                    if let Some(t) = self.extract_trait(&child, source, &nested_path) {
+                        types.push(t);
+                    }
+                }
+                "mod_item" => {
+                    self.extract_mod_contents(&child, source, &nested_path, functions, types);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn build_rust_signature(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        name: &str,
+    ) -> String {
+        let params = node
+            .child_by_field_name("parameters")
+            .map(|n| node_text(&n, source))
+            .unwrap_or("()");
+
+        let return_type = node
+            .child_by_field_name("return_type")
+            .map(|n| format!(" -> {}", node_text(&n, source)))
+            .unwrap_or_default();
+
+        format!("fn {}{}{}", name, params, return_type)
+    }
+
+    fn extract_visibility(&self, node: &tree_sitter::Node) -> Scope {
+        // Check for visibility modifier (pub, pub(crate), etc.)
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "visibility_modifier" {
+                return Scope::Public;
+            }
+        }
+        Scope::Internal
+    }
+
+    fn extract_calls(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<CallSite> {
+        let mut calls = Vec::new();
+        self.collect_calls(node, source, &mut calls);
+        calls
+    }
+
+    fn collect_calls(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        calls: &mut Vec<CallSite>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some(call_site) = self.extract_call_site(node, source) {
+                calls.push(call_site);
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_calls(&child, source, calls);
+        }
+    }
+
+    fn extract_call_site(&self, node: &tree_sitter::Node, source: &[u8]) -> Option<CallSite> {
+        // call_expression has 'function' field
+        let func_node = node.child_by_field_name("function")?;
+        let raw = node_text(&func_node, source).to_string();
+
+        let line = node.start_position().row as u32 + 1;
+
+        Some(CallSite {
+            target: "[unresolved]".to_string(),
+            raw,
+            line,
+        })
+    }
+}
+
+/// Convert Rust file path to module path
+/// "src/parser.rs" -> "parser"
+/// "src/commands/index.rs" -> "commands::index"
+/// "src/lib.rs" -> ""
+/// "src/main.rs" -> ""
+fn rust_path_to_module(path: &str) -> String {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let path = path.strip_prefix("src/").unwrap_or(path);
+
+    // Remove .rs extension
+    let path = path.strip_suffix(".rs").unwrap_or(path);
+
+    // lib.rs and main.rs are crate roots
+    if path == "lib" || path == "main" {
+        return String::new();
+    }
+
+    // mod.rs files use parent directory name
+    if path.ends_with("/mod") {
+        let parent = &path[..path.len() - 4];
+        return parent.replace('/', "::");
+    }
+
+    path.replace('/', "::")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +934,131 @@ func (s *Server) init() {}
         assert_eq!(start.calls.len(), 2);
         assert_eq!(start.calls[0].raw, "s.logger.Info");
         assert_eq!(start.calls[1].raw, "s.init");
+    }
+
+    // ========================================================================
+    // Rust Parser Tests
+    // ========================================================================
+
+    #[test]
+    fn test_rust_parse_simple_function() {
+        let source = r#"
+pub fn hello(name: &str) -> String {
+    format!("Hello, {}", name)
+}
+"#;
+        let mut parser = RustParser::new();
+        let entry = parser.parse_file(source, "src/lib.rs").unwrap();
+
+        assert_eq!(entry.functions.len(), 1);
+        let f = &entry.functions[0];
+        assert_eq!(f.name, "hello");
+        assert_eq!(f.qualified_name, "hello");
+        assert_eq!(f.scope, Scope::Public);
+        assert!(f.signature.contains("fn hello"));
+    }
+
+    #[test]
+    fn test_rust_parse_impl_methods() {
+        let source = r#"
+pub struct Server {
+    addr: String,
+}
+
+impl Server {
+    pub fn new(addr: String) -> Self {
+        Self { addr }
+    }
+
+    pub fn start(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn internal_method(&self) {}
+}
+"#;
+        let mut parser = RustParser::new();
+        let entry = parser.parse_file(source, "src/server.rs").unwrap();
+
+        assert_eq!(entry.functions.len(), 3);
+        assert_eq!(entry.types.len(), 1);
+
+        let new_fn = entry.functions.iter().find(|f| f.name == "new").unwrap();
+        assert_eq!(new_fn.qualified_name, "server::Server::new");
+        assert_eq!(new_fn.receiver, Some("Server".to_string()));
+        assert_eq!(new_fn.scope, Scope::Public);
+
+        let start_fn = entry.functions.iter().find(|f| f.name == "start").unwrap();
+        assert_eq!(start_fn.qualified_name, "server::Server::start");
+
+        let internal = entry.functions.iter().find(|f| f.name == "internal_method").unwrap();
+        assert_eq!(internal.scope, Scope::Internal);
+
+        let server_type = &entry.types[0];
+        assert_eq!(server_type.name, "Server");
+        assert_eq!(server_type.kind, TypeKind::Struct);
+    }
+
+    #[test]
+    fn test_rust_extract_calls() {
+        let source = r#"
+fn greet(name: &str) {
+    println!("Hello, {}", name);
+}
+
+fn main() {
+    greet("world");
+    println!("Done");
+}
+"#;
+        let mut parser = RustParser::new();
+        let entry = parser.parse_file(source, "src/main.rs").unwrap();
+
+        assert_eq!(entry.functions.len(), 2);
+
+        // greet has one macro call (println!) which isn't a call_expression
+        let greet = entry.functions.iter().find(|f| f.name == "greet").unwrap();
+        assert_eq!(greet.calls.len(), 0); // macros aren't call_expressions
+
+        // main has one function call: greet
+        let main_fn = entry.functions.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(main_fn.calls.len(), 1);
+        assert_eq!(main_fn.calls[0].raw, "greet");
+    }
+
+    #[test]
+    fn test_rust_parse_enum_and_trait() {
+        let source = r#"
+pub enum Status {
+    Active,
+    Inactive,
+}
+
+pub trait Handler {
+    fn handle(&self);
+}
+"#;
+        let mut parser = RustParser::new();
+        let entry = parser.parse_file(source, "src/types.rs").unwrap();
+
+        assert_eq!(entry.types.len(), 2);
+
+        let status = entry.types.iter().find(|t| t.name == "Status").unwrap();
+        assert_eq!(status.kind, TypeKind::Enum);
+        assert_eq!(status.qualified_name, "types::Status");
+
+        let handler = entry.types.iter().find(|t| t.name == "Handler").unwrap();
+        assert_eq!(handler.kind, TypeKind::Interface);
+        assert_eq!(handler.qualified_name, "types::Handler");
+    }
+
+    #[test]
+    fn test_rust_module_path() {
+        assert_eq!(rust_path_to_module("src/lib.rs"), "");
+        assert_eq!(rust_path_to_module("src/main.rs"), "");
+        assert_eq!(rust_path_to_module("src/parser.rs"), "parser");
+        assert_eq!(rust_path_to_module("src/commands/index.rs"), "commands::index");
+        assert_eq!(rust_path_to_module("./src/foo/bar.rs"), "foo::bar");
+        assert_eq!(rust_path_to_module("src/utils/mod.rs"), "utils");
     }
 }

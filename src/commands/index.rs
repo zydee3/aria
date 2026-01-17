@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::index::Index;
-use crate::parser::GoParser;
+use crate::parser::{GoParser, RustParser};
 use crate::resolver::Resolver;
 use crate::summarizer::{Summarizer, SummaryRequest};
 use crate::topo;
@@ -24,8 +24,12 @@ pub fn run() -> ExitCode {
     // Load config
     let config = load_config(aria_dir);
 
+    // Load existing index to preserve summaries/embeddings for unchanged functions
+    let old_index = load_existing_index(aria_dir);
+
     let mut index = Index::new();
-    let mut parser = GoParser::new();
+    let mut go_parser = GoParser::new();
+    let mut rust_parser = RustParser::new();
     let mut file_count = 0;
     let mut func_count = 0;
     let mut type_count = 0;
@@ -33,25 +37,27 @@ pub fn run() -> ExitCode {
     // Store sources for body extraction during summarization
     let mut sources: HashMap<String, String> = HashMap::new();
 
-    // Walk current directory for Go files
+    // Walk current directory for source files
     for entry in WalkDir::new(".")
         .into_iter()
         .filter_entry(|e| !is_hidden(e) && !is_ignored(e))
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
 
-        // Skip non-Go files
-        if path.extension().is_none_or(|ext| ext != "go") {
-            continue;
-        }
+        // Determine language from extension
+        let lang = match ext {
+            Some("go") => "go",
+            Some("rs") => "rust",
+            _ => continue,
+        };
 
-        // Skip test files for now
-        if path.to_string_lossy().ends_with("_test.go") {
-            continue;
-        }
-
+        // Skip test files
         let path_str = path.to_string_lossy();
+        if lang == "go" && path_str.ends_with("_test.go") {
+            continue;
+        }
 
         // Read and parse file
         let source = match fs::read_to_string(path) {
@@ -62,7 +68,13 @@ pub fn run() -> ExitCode {
             }
         };
 
-        match parser.parse_file(&source, &path_str) {
+        let parsed = match lang {
+            "go" => go_parser.parse_file(&source, &path_str),
+            "rust" => rust_parser.parse_file(&source, &path_str),
+            _ => None,
+        };
+
+        match parsed {
             Some(entry) => {
                 func_count += entry.functions.len();
                 type_count += entry.types.len();
@@ -88,6 +100,12 @@ pub fn run() -> ExitCode {
     let mut resolver = Resolver::new();
     resolver.build_symbol_table(&index.files);
     resolver.resolve(&mut index);
+
+    // Preserve summaries from old index for unchanged functions (by ast_hash)
+    let preserved = preserve_summaries(&mut index, &old_index);
+    if preserved > 0 {
+        println!("Preserved {} existing summaries", preserved);
+    }
 
     // Generate summaries if enabled
     if config.features.summaries {
@@ -408,4 +426,50 @@ fn get_git_head() -> Option<String> {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+}
+
+fn load_existing_index(aria_dir: &Path) -> Option<Index> {
+    let index_path = aria_dir.join("index.json");
+    fs::read_to_string(index_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+/// Preserve summaries from old index for functions with matching ast_hash.
+/// Returns the number of summaries preserved.
+fn preserve_summaries(index: &mut Index, old_index: &Option<Index>) -> usize {
+    let Some(old) = old_index else {
+        return 0;
+    };
+
+    // Build lookup: ast_hash -> summary for old functions
+    let mut old_summaries: HashMap<String, String> = HashMap::new();
+    for entry in old.files.values() {
+        for func in &entry.functions {
+            if let Some(summary) = &func.summary {
+                if !func.ast_hash.is_empty() {
+                    old_summaries.insert(func.ast_hash.clone(), summary.clone());
+                }
+            }
+        }
+    }
+
+    if old_summaries.is_empty() {
+        return 0;
+    }
+
+    // Apply to new index
+    let mut preserved = 0;
+    for entry in index.files.values_mut() {
+        for func in &mut entry.functions {
+            if func.summary.is_none() && !func.ast_hash.is_empty() {
+                if let Some(summary) = old_summaries.get(&func.ast_hash) {
+                    func.summary = Some(summary.clone());
+                    preserved += 1;
+                }
+            }
+        }
+    }
+
+    preserved
 }

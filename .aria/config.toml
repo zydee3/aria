@@ -1,0 +1,16 @@
+debug = false
+
+[llm]
+provider = "anthropic"
+model = "claude-3-haiku"
+batch_size = 10
+parallel = 4
+
+[embeddings]
+ollama_url = "http://localhost:11434"
+model = "nomic-embed-text"
+batch_size = 50
+
+[features]
+summaries = false
+embeddings = false
