@@ -9,6 +9,9 @@ pub struct Index {
     pub commit: String,
     pub indexed_at: DateTime<Utc>,
     pub files: HashMap<String, FileEntry>,
+    /// External symbols (syscalls, libc, macros) referenced but not defined in codebase
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub externals: HashMap<String, ExternalEntry>,
 }
 
 impl Index {
@@ -18,6 +21,7 @@ impl Index {
             commit: String::new(),
             indexed_at: Utc::now(),
             files: HashMap::new(),
+            externals: HashMap::new(),
         }
     }
 }
@@ -90,4 +94,17 @@ pub enum TypeKind {
     Interface,
     Typedef,
     Enum,
+}
+
+/// Entry for an external symbol (syscall, libc function, macro)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalEntry {
+    /// Kind of external: syscall, libc, macro, external
+    pub kind: String,
+    /// Optional summary/description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Number of call sites referencing this external
+    #[serde(default)]
+    pub references: u32,
 }

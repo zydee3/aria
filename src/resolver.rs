@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::index::{FileEntry, Index};
+use crate::externals::ExternalDb;
+use crate::index::{ExternalEntry, FileEntry, Index};
 
 /// Resolves call targets to qualified names and populates called_by relationships
 pub struct Resolver {
@@ -52,8 +53,12 @@ impl Resolver {
 
     /// Resolve all calls in the index and populate called_by
     pub fn resolve(&self, index: &mut Index) {
+        let external_db = ExternalDb::new();
+
         // First pass: resolve call targets
         let mut calls_to_targets: HashMap<String, Vec<String>> = HashMap::new();
+        // Track external references: name -> (kind, summary, count)
+        let mut external_refs: HashMap<String, (String, Option<&'static str>, u32)> = HashMap::new();
 
         for (file_path, entry) in index.files.iter_mut() {
             // Extract package from file path or first function's qualified name
@@ -66,10 +71,22 @@ impl Resolver {
             for func in &mut entry.functions {
                 for call in &mut func.calls {
                     let target = self.resolve_call(&call.raw, &package, file_path);
-                    call.target = target.clone();
 
-                    // Track for called_by population
-                    if target != "[unresolved]" {
+                    if target == "[unresolved]" {
+                        // Categorize the external call
+                        let (kind, summary) = external_db.categorize(&call.raw);
+                        let formatted = format!("[{}:{}]", kind.as_str(), call.raw);
+                        call.target = formatted;
+
+                        // Track external reference
+                        external_refs
+                            .entry(call.raw.clone())
+                            .and_modify(|(_, _, count)| *count += 1)
+                            .or_insert((kind.as_str().to_string(), summary, 1));
+                    } else {
+                        call.target = target.clone();
+
+                        // Track for called_by population
                         calls_to_targets
                             .entry(target)
                             .or_default()
@@ -88,6 +105,18 @@ impl Resolver {
                     func.called_by.dedup();
                 }
             }
+        }
+
+        // Populate externals in index
+        for (name, (kind, summary, count)) in external_refs {
+            index.externals.insert(
+                name,
+                ExternalEntry {
+                    kind,
+                    summary: summary.map(String::from),
+                    references: count,
+                },
+            );
         }
     }
 
@@ -298,7 +327,11 @@ mod tests {
 
         let entry = index.files.get("./cmd/app/main.go").unwrap();
         let main_fn = entry.functions.iter().find(|f| f.name == "main").unwrap();
-        // fmt is external, should remain unresolved
-        assert_eq!(main_fn.calls[0].target, "[unresolved]");
+        // fmt.Println is external, should be categorized
+        assert_eq!(main_fn.calls[0].target, "[external:fmt.Println]");
+
+        // Should be tracked in externals
+        assert!(index.externals.contains_key("fmt.Println"));
+        assert_eq!(index.externals.get("fmt.Println").unwrap().kind, "external");
     }
 }
