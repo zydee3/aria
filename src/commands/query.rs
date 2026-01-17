@@ -26,6 +26,9 @@ pub enum QueryCommand {
         /// Show summaries for each function call
         #[arg(long, short = 's')]
         summaries: bool,
+        /// Show caller chain up to root before forward trace
+        #[arg(long, short = 'c')]
+        callers: bool,
     },
 
     /// Find all usages of a symbol (backward edge: what calls this function)
@@ -64,7 +67,7 @@ pub fn run(cmd: QueryCommand) -> ExitCode {
 
     match cmd {
         QueryCommand::Function { name } => query_function(&index, &name),
-        QueryCommand::Trace { name, depth, summaries } => query_trace(&index, &name, depth, summaries),
+        QueryCommand::Trace { name, depth, summaries, callers } => query_trace(&index, &name, depth, summaries, callers),
         QueryCommand::Usages { name, depth, summaries } => query_usages(&index, &name, depth, summaries),
         QueryCommand::File { path } => query_file(&index, &path),
         QueryCommand::List { path } => query_list(&index, path.as_deref()),
@@ -155,7 +158,7 @@ fn query_function(index: &Index, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn query_trace(index: &Index, name: &str, max_depth: usize, show_summaries: bool) -> ExitCode {
+fn query_trace(index: &Index, name: &str, max_depth: usize, show_summaries: bool, show_callers: bool) -> ExitCode {
     let func_map = build_function_map(index);
     let matches = find_functions(index, name);
 
@@ -172,20 +175,114 @@ fn query_trace(index: &Index, name: &str, max_depth: usize, show_summaries: bool
         eprintln!();
     }
 
-    // Print root
-    print_trace_node(file_path, func, "", true, show_summaries);
-
-    // Recursively print call tree
-    let mut visited = HashSet::new();
-    visited.insert(func.qualified_name.as_str());
-
     // Track seen externals so we only show summary on first occurrence
     let mut seen_externals = HashSet::new();
     let external_db = if show_summaries { Some(ExternalDb::new()) } else { None };
 
-    print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+    // If showing callers, build and print the caller chain first
+    if show_callers {
+        let caller_chain = build_caller_chain(&func_map, func);
+        if !caller_chain.is_empty() {
+            // Print callers from root down to parent of target
+            for (i, (caller_file, caller_func)) in caller_chain.iter().enumerate() {
+                let indent = "  ".repeat(i);
+                print_caller_chain_node(caller_file, caller_func, &indent, show_summaries);
+            }
+            // Print arrow to show the target function
+            let target_indent = "  ".repeat(caller_chain.len());
+            println!("{}└─▶ {} ({}:{}-{}){}",
+                target_indent,
+                func.qualified_name,
+                file_path,
+                func.line_start,
+                func.line_end,
+                if show_summaries {
+                    func.summary.as_ref().map(|s| format!(" : \"{}\"", s)).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            );
+            // Print forward edges with additional indent
+            let mut visited = HashSet::new();
+            visited.insert(func.qualified_name.as_str());
+            let forward_prefix = format!("{}    ", target_indent);
+            print_trace_children(&func_map, index, func, &forward_prefix, max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+        } else {
+            // No callers - this is a root function, print normally
+            println!("[root]");
+            print_trace_node(file_path, func, "", true, show_summaries);
+            let mut visited = HashSet::new();
+            visited.insert(func.qualified_name.as_str());
+            print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+        }
+    } else {
+        // Original behavior - just print forward trace
+        print_trace_node(file_path, func, "", true, show_summaries);
+        let mut visited = HashSet::new();
+        visited.insert(func.qualified_name.as_str());
+        print_trace_children(&func_map, index, func, "", max_depth, 1, &mut visited, show_summaries, &mut seen_externals, &external_db);
+    }
 
     ExitCode::SUCCESS
+}
+
+/// Build caller chain from root to the target function's parent
+/// Returns vec of (file_path, function) from root down to immediate caller
+fn build_caller_chain<'a>(
+    func_map: &HashMap<&'a str, (&'a str, &'a Function)>,
+    target: &'a Function,
+) -> Vec<(&'a str, &'a Function)> {
+    // Find path from any root to the target using BFS
+    // We want the shortest path from a root (function with no callers) to target's caller
+
+    if target.called_by.is_empty() {
+        return Vec::new(); // Target is a root
+    }
+
+    // Work backwards: find a path from target to a root, then reverse
+    let mut chain = Vec::new();
+    let mut current = target;
+    let mut visited = HashSet::new();
+    visited.insert(target.qualified_name.as_str());
+
+    while !current.called_by.is_empty() {
+        // Pick first caller that we haven't visited
+        let caller_name = current.called_by.iter()
+            .find(|name| !visited.contains(name.as_str()));
+
+        match caller_name {
+            Some(name) => {
+                if let Some((file, caller_func)) = func_map.get(name.as_str()) {
+                    visited.insert(name.as_str());
+                    chain.push((*file, *caller_func));
+                    current = caller_func;
+                } else {
+                    break; // External caller, stop here
+                }
+            }
+            None => break, // All callers visited (cycle), stop
+        }
+    }
+
+    chain.reverse();
+    chain
+}
+
+/// Print a node in the caller chain (going down toward target)
+fn print_caller_chain_node(file_path: &str, func: &Function, indent: &str, show_summary: bool) {
+    let summary_part = if show_summary {
+        func.summary.as_ref().map(|s| format!(" : \"{}\"", s)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    println!("{}{} ({}:{}-{}){}",
+        indent,
+        func.qualified_name,
+        file_path,
+        func.line_start,
+        func.line_end,
+        summary_part
+    );
 }
 
 fn print_trace_node(file_path: &str, func: &Function, prefix: &str, is_root: bool, show_summary: bool) {
