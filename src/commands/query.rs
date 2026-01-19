@@ -14,6 +14,9 @@ pub enum QueryCommand {
     Function {
         /// Qualified function name (or partial match)
         name: String,
+        /// Print only the source code
+        #[arg(long, short = 's')]
+        source_only: bool,
     },
 
     /// Trace call graph (forward edge: what does this function call)
@@ -66,7 +69,7 @@ pub fn run(cmd: QueryCommand) -> ExitCode {
     };
 
     match cmd {
-        QueryCommand::Function { name } => query_function(&index, &name),
+        QueryCommand::Function { name, source_only } => query_function(&index, &name, source_only),
         QueryCommand::Trace { name, depth, summaries, callers } => {
             let max_depth = if depth == 0 { usize::MAX } else { depth };
             query_trace(&index, &name, max_depth, summaries, callers)
@@ -128,7 +131,7 @@ fn find_functions<'a>(index: &'a Index, name: &str) -> Vec<(&'a str, &'a Functio
     matches
 }
 
-fn query_function(index: &Index, name: &str) -> ExitCode {
+fn query_function(index: &Index, name: &str, source_only: bool) -> ExitCode {
     let matches = find_functions(index, name);
 
     if matches.is_empty() {
@@ -137,6 +140,21 @@ fn query_function(index: &Index, name: &str) -> ExitCode {
     }
 
     for (file_path, func) in &matches {
+        if source_only {
+            // Print only the raw source code
+            if let Ok(content) = fs::read_to_string(file_path) {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = (func.line_start as usize).saturating_sub(1);
+                let end = (func.line_end as usize).min(lines.len());
+                if start < lines.len() {
+                    for line in &lines[start..end] {
+                        println!("{line}");
+                    }
+                }
+            }
+            continue;
+        }
+
         println!("{} ({}:{}-{})", func.qualified_name, file_path, func.line_start, func.line_end);
         println!("  {}", func.signature);
 
@@ -155,6 +173,19 @@ fn query_function(index: &Index, name: &str) -> ExitCode {
             println!("  called_by:");
             for caller in &func.called_by {
                 println!("    {caller}");
+            }
+        }
+
+        // Print source code
+        if let Ok(content) = fs::read_to_string(file_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = (func.line_start as usize).saturating_sub(1);
+            let end = (func.line_end as usize).min(lines.len());
+            if start < lines.len() {
+                println!("  source:");
+                for line in &lines[start..end] {
+                    println!("    {line}");
+                }
             }
         }
 

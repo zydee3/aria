@@ -58,6 +58,39 @@ With `-c`, shows the full call path from root to your target, then forward calls
 [4] ---- childCall (./child.c:1-5)
 ```
 
+
+## Function Command
+```bash
+aria query function <name> [OPTIONS]
+  -s, --source-only  # Show function source only
+```
+
+```bash
+vince@vince:~/criu$ aria query function -s write_all
+ssize_t write_all(int fd, const void *buf, size_t size)
+{
+	ssize_t n = 0;
+	while (size > 0) {
+		ssize_t ret = write(fd, buf, size);
+		if (ret == -1) {
+			if (errno == EINTR)
+				continue;
+			/*
+			 * The caller should use standard write() for
+			 * non-blocking I/O.
+			 */
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				errno = EINVAL;
+			return ret;
+		}
+		n += ret;
+		buf = (char *)buf + ret;
+		size -= ret;
+	}
+	return n;
+}
+```
+
 ## Examples
 
 ```bash
