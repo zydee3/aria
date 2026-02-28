@@ -280,7 +280,7 @@ fn build_topology(
             let callees: HashSet<String> = func
                 .calls
                 .iter()
-                .filter(|c| c.target != "[unresolved]")
+                .filter(|c| !c.target.starts_with('['))
                 .map(|c| c.target.clone())
                 .collect();
 
@@ -290,8 +290,7 @@ fn build_topology(
         }
     }
 
-    let levels = topo::assign_levels(&all_functions, &calls_map);
-    let level_groups = topo::group_by_level(&levels);
+    let level_groups = topo::hierarchy(&all_functions, &calls_map);
 
     let duplicates = total_funcs - all_functions.len();
     println!(
@@ -343,7 +342,7 @@ fn collect_level_requests(
         let callee_context: Vec<(String, String)> = func
             .calls
             .iter()
-            .filter(|c| c.target != "[unresolved]")
+            .filter(|c| !c.target.starts_with('['))
             .filter_map(|c| {
                 summaries.get(&c.target).map(|s| {
                     let simple_name = c.target.rsplit('.').next().unwrap_or(&c.target);
@@ -353,11 +352,11 @@ fn collect_level_requests(
             .collect();
 
         if debug {
-            let resolved_count = func.calls.iter().filter(|c| c.target != "[unresolved]").count();
+            let resolved_count = func.calls.iter().filter(|c| !c.target.starts_with('[')).count();
             if resolved_count > 0 {
                 if callee_context.is_empty() {
                     let missed: Vec<_> = func.calls.iter()
-                        .filter(|c| c.target != "[unresolved]")
+                        .filter(|c| !c.target.starts_with('['))
                         .map(|c| &c.target)
                         .collect();
                     eprintln!(

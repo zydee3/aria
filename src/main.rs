@@ -31,8 +31,8 @@ enum Command {
         kind: Option<String>,
     },
 
-    /// Show call graph for a function
-    Callstack {
+    /// Trace call graph for a function
+    Trace {
         /// Function name (exact, then contains match)
         name: String,
         /// Show only forward trace (what this function calls)
@@ -45,6 +45,9 @@ enum Command {
         #[arg(long, short = 'd', default_value = "2")]
         depth: usize,
     },
+
+    /// Rank functions by dependency depth
+    Rank,
 }
 
 fn main() -> std::process::ExitCode {
@@ -53,8 +56,9 @@ fn main() -> std::process::ExitCode {
     match cli.command {
         Command::Index => commands::index::run(),
         Command::Source { name, kind } => commands::source::run(&name, kind.as_deref()),
-        Command::Callstack { name, forward, backward, depth } => {
+        Command::Trace { name, forward, backward, depth } => {
             commands::callstack::run(&name, forward, backward, depth)
         }
+        Command::Rank => commands::topo::run(),
     }
 }

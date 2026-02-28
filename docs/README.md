@@ -14,10 +14,13 @@ aria source <name> --kind function         # Filter to functions only
 aria source <name> --kind struct           # Filter to structs only
 
 # Show call graph
-aria callstack <name>                      # Both directions (callers + callees)
-aria callstack <name> -f                   # Forward only (what does this call?)
-aria callstack <name> -b                   # Backward only (what calls this?)
-aria callstack <name> -d 3                 # Depth limit (default: 2, 0 = unlimited)
+aria trace <name>                      # Both directions (callers + callees)
+aria trace <name> -f                   # Forward only (what does this call?)
+aria trace <name> -b                   # Backward only (what calls this?)
+aria trace <name> -d 3                 # Depth limit (default: 2, 0 = unlimited)
+
+# Rank functions by dependency depth
+aria rank                                 # Writes .aria/topo.json (cached)
 ```
 
 ## Finding Symbols
@@ -45,11 +48,11 @@ Available kinds: `function`, `struct`, `enum`, `typedef`, `interface`, `variable
 
 ## Call Graph
 
-`aria callstack` shows the call graph for a function. By default it shows both directions.
+`aria trace` shows the call graph for a function. By default it shows both directions.
 
 ### Forward Trace (what does this function call?)
 ```bash
-$ aria callstack main -f
+$ aria trace main -f
 [0] main (./main.go:10-50)
 [1] - process (./proc.go:20-80)
 [2] -- handler (./handler.go:5-30)
@@ -58,7 +61,7 @@ $ aria callstack main -f
 
 ### Backward Trace (what calls this function?)
 ```bash
-$ aria callstack handler -b
+$ aria trace handler -b
 handler (./handler.go:5-30)
   called by:
   └── process (./proc.go:20-80)
@@ -67,11 +70,23 @@ handler (./handler.go:5-30)
 
 ### Both Directions (default)
 ```bash
-$ aria callstack process
+$ aria trace process
 process (./proc.go:20-80)
   called by:
   └── main (./main.go:10-50)
 
 [0] process (./proc.go:20-80)
 [1] - handler (./handler.go:5-30)
+```
+
+## Dependency Ranking
+
+`aria rank` groups all functions by dependency depth and writes `.aria/topo.json`. Level 0 contains leaf functions (no calls to other indexed functions). Level N contains functions that only call functions at levels 0..N-1. Output is deterministic — same index always produces the same ranking.
+
+```bash
+$ aria rank
+Wrote topo.json: 150 functions in 8 levels (12.34ms)
+
+$ aria rank
+topo.json: up to date
 ```

@@ -31,16 +31,19 @@ aria source <name>
 aria source <name> --kind struct
 
 # Show call graph in both directions
-aria callstack <name> 
+aria trace <name> 
 
 # Show forward call graph (callees)
-aria callstack <name> -f
+aria trace <name> -f
 
 # Show backwards call graph (callers)
-aria callstack <name> -b
+aria trace <name> -b
 
 # Limit call graph depth (default: 2, 0 = unlimited)
-aria callstack <name> -d 3
+aria trace <name> -d 3
+
+# Rank functions by dependency depth
+aria rank
 ```
 
 ## How it works
@@ -49,9 +52,14 @@ aria callstack <name> -d 3
 - Walk the source tree
 - Parse each file with tree-sitter
 - Resolve call targets across files
-- Write to `.aria`: 
+- Write to `.aria/`:
     - `.aria/index.json` with function indexes
     - `.aria/README.md` with usage instructions
+
+`aria rank` will:
+- Read `.aria/index.json`
+- Compute topological ordering (functions grouped by dependency depth)
+- Write `.aria/topo.json` (cached — skips if index unchanged)
 
 Per-function LLM summaries are optional. Enable `features.summaries` in `.aria/config.toml`.
 
