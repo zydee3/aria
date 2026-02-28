@@ -20,7 +20,7 @@ aria trace <name> -b                   # Backward only (what calls this?)
 aria trace <name> -d 3                 # Depth limit (default: 2, 0 = unlimited)
 
 # Rank functions by dependency depth
-aria rank                                 # Writes .aria/rank.json (cached)
+aria rank                                 # Writes .aria/rank.json
 ```
 
 ## Finding Symbols
@@ -81,12 +81,9 @@ process (./proc.go:20-80)
 
 ## Dependency Ranking
 
-`aria rank` groups all functions by dependency depth and writes `.aria/rank.json`. Level 0 contains leaf functions (no calls to other indexed functions). Level N contains functions that only call functions at levels 0..N-1. Output is deterministic — same index always produces the same ranking.
+`aria rank` groups all functions by dependency depth and writes `.aria/rank.json`. Level 0 contains leaf functions (no calls to other indexed functions). Level N contains functions that only call functions at levels 0..N-1. Output is deterministic. Same index always produces the same ranking.
 
 ```bash
 $ aria rank
 Wrote rank.json: 150 functions in 8 levels (12.34ms)
-
-$ aria rank
-rank.json: up to date
 ```
