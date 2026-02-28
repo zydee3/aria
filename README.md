@@ -59,7 +59,7 @@ aria rank
 `aria rank` will:
 - Read `.aria/index.json`
 - Compute topological ordering (functions grouped by dependency depth)
-- Write `.aria/topo.json` (cached — skips if index unchanged)
+- Write `.aria/rank.json` (cached — skips if index unchanged)
 
 Per-function LLM summaries are optional. Enable `features.summaries` in `.aria/config.toml`.
 

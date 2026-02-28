@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::index;
+use crate::index::{self, Index};
 use crate::topo;
 
-const OUTPUT_FILE: &str = "topo.json";
+const OUTPUT_FILE: &str = "rank.json";
 
 #[derive(Serialize, Deserialize)]
-struct TopoOutput {
+struct RankOutput {
     index_hash: String,
     levels: Vec<Vec<String>>,
 }
@@ -21,10 +21,8 @@ struct TopoOutput {
 pub fn run() -> ExitCode {
     let start = Instant::now();
     let aria_dir = Path::new(".aria");
-    let index_path = aria_dir.join("index.json");
     let output_path = aria_dir.join(OUTPUT_FILE);
 
-    // Load index
     let idx = match index::load_index() {
         Ok(i) => i,
         Err(e) => {
@@ -33,50 +31,23 @@ pub fn run() -> ExitCode {
         }
     };
 
-    // Compute hash of raw index.json bytes
-    let index_bytes = match fs::read(&index_path) {
-        Ok(b) => b,
+    let index_hash = match compute_index_hash(aria_dir) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("error: failed to read index.json: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let index_hash = format!("{:016x}", hash_bytes(&index_bytes));
 
-    // Check cache
-    if let Ok(existing) = fs::read_to_string(&output_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&existing) {
-            if val.get("index_hash").and_then(|v| v.as_str()) == Some(&index_hash) {
-                println!("{OUTPUT_FILE}: up to date");
-                return ExitCode::SUCCESS;
-            }
-        }
+    if is_cache_valid(&output_path, &index_hash) {
+        println!("{OUTPUT_FILE}: up to date");
+        return ExitCode::SUCCESS;
     }
 
-    // Build call graph from index
-    let mut all_functions: HashSet<String> = HashSet::new();
-    let mut calls_map: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for entry in idx.files.values() {
-        for func in &entry.functions {
-            all_functions.insert(func.qualified_name.clone());
-
-            let callees: HashSet<String> = func
-                .calls
-                .iter()
-                .filter(|c| !c.target.starts_with('['))
-                .map(|c| c.target.clone())
-                .collect();
-
-            if !callees.is_empty() {
-                calls_map.insert(func.qualified_name.clone(), callees);
-            }
-        }
-    }
-
+    let (all_functions, calls_map) = build_call_graph(&idx);
     let levels = topo::hierarchy(&all_functions, &calls_map);
 
-    let output = TopoOutput {
+    let output = RankOutput {
         index_hash,
         levels,
     };
@@ -104,9 +75,44 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn hash_bytes(input: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    hasher.finish()
+fn compute_index_hash(aria_dir: &Path) -> Result<String, String> {
+    let bytes = fs::read(aria_dir.join("index.json"))
+        .map_err(|e| format!("failed to read index.json: {e}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn is_cache_valid(output_path: &Path, index_hash: &str) -> bool {
+    let Ok(existing) = fs::read_to_string(output_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&existing) else {
+        return false;
+    };
+    val.get("index_hash").and_then(|v| v.as_str()) == Some(index_hash)
+}
+
+fn build_call_graph(idx: &Index) -> (HashSet<String>, HashMap<String, HashSet<String>>) {
+    let mut all_functions: HashSet<String> = HashSet::new();
+    let mut calls_map: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for entry in idx.files.values() {
+        for func in &entry.functions {
+            all_functions.insert(func.qualified_name.clone());
+
+            let callees: HashSet<String> = func
+                .calls
+                .iter()
+                .filter(|c| !c.target.starts_with('['))
+                .map(|c| c.target.clone())
+                .collect();
+
+            if !callees.is_empty() {
+                calls_map.insert(func.qualified_name.clone(), callees);
+            }
+        }
+    }
+
+    (all_functions, calls_map)
 }

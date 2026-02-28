@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
-use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Returns functions grouped by dependency level, with deterministic ordering.
 ///
@@ -19,76 +18,7 @@ pub fn hierarchy(
     let dag = build_scc_dag(&func_to_scc, &calls);
     let scc_levels = assign_scc_levels(sccs.len(), &dag);
 
-    let max_level = scc_levels.iter().copied().max().unwrap_or(0);
-    let mut groups: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
-
-    for func in &funcs {
-        if let Some(&scc_idx) = func_to_scc.get(func.as_str()) {
-            groups[scc_levels[scc_idx]].push(func.clone());
-        }
-    }
-
-    for group in &mut groups {
-        group.sort();
-    }
-
-    groups
-}
-
-/// Returns a single flat list where every function appears after all functions it calls.
-///
-/// Uses Kahn's algorithm on the SCC DAG with deterministic tie-breaking
-/// (alphabetical order by the smallest function name in each SCC).
-/// Functions in mutual recursion cycles (SCCs) are expanded in alphabetical
-/// order at the position determined by the SCC's topological placement.
-///
-/// Given the same input, the output is identical across every run.
-pub fn linearize(
-    functions: &HashSet<String>,
-    calls: &HashMap<String, HashSet<String>>,
-) -> Vec<String> {
-    let (funcs, calls) = to_sorted(functions, calls);
-    let (sccs, func_to_scc) = find_sccs(&funcs, &calls);
-    let dag = build_scc_dag(&func_to_scc, &calls);
-
-    // Sort key for each SCC: minimum function name (SCCs are already sorted internally)
-    let scc_sort_key: Vec<String> = sccs
-        .iter()
-        .map(|scc| scc.first().cloned().unwrap_or_default())
-        .collect();
-
-    // out_degree = number of distinct SCC dependencies (callees)
-    let mut out_degree: Vec<usize> = vec![0; sccs.len()];
-    for (&scc_idx, deps) in &dag.deps {
-        out_degree[scc_idx] = deps.len();
-    }
-
-    // Min-heap keyed by SCC's sort key for deterministic processing order
-    let mut heap: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
-    for scc_idx in 0..sccs.len() {
-        if out_degree[scc_idx] == 0 {
-            heap.push(Reverse((scc_sort_key[scc_idx].clone(), scc_idx)));
-        }
-    }
-
-    let mut result: Vec<String> = Vec::with_capacity(funcs.len());
-
-    while let Some(Reverse((_, scc_idx))) = heap.pop() {
-        // Expand SCC in sorted order (already sorted from find_sccs)
-        result.extend(sccs[scc_idx].iter().cloned());
-
-        // Update callers: decrement their out_degree, push when ready
-        if let Some(callers) = dag.rdeps.get(&scc_idx) {
-            for &caller_scc in callers {
-                out_degree[caller_scc] -= 1;
-                if out_degree[caller_scc] == 0 {
-                    heap.push(Reverse((scc_sort_key[caller_scc].clone(), caller_scc)));
-                }
-            }
-        }
-    }
-
-    result
+    group_functions_by_level(&funcs, &func_to_scc, &scc_levels)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +54,18 @@ fn find_sccs(
     functions: &BTreeSet<String>,
     calls: &BTreeMap<String, BTreeSet<String>>,
 ) -> (Vec<Vec<String>>, HashMap<String, usize>) {
-    // First DFS: compute finish order (deterministic via BTreeSet iteration)
+    let finish_order = compute_finish_order(functions, calls);
+    let reverse = build_reverse_graph(functions, calls);
+    let sccs = extract_sccs(&finish_order, &reverse);
+    let func_to_scc = build_scc_index(&sccs);
+    (sccs, func_to_scc)
+}
+
+/// First pass of Kosaraju: DFS in forward direction to compute finish order.
+fn compute_finish_order<'a>(
+    functions: &'a BTreeSet<String>,
+    calls: &'a BTreeMap<String, BTreeSet<String>>,
+) -> Vec<&'a str> {
     let mut visited: HashSet<&str> = HashSet::new();
     let mut finish_order: Vec<&str> = Vec::new();
 
@@ -134,7 +75,14 @@ fn find_sccs(
         }
     }
 
-    // Build reverse graph with sorted adjacency (BTreeSet)
+    finish_order
+}
+
+/// Build the reverse (transposed) call graph for the second Kosaraju pass.
+fn build_reverse_graph<'a>(
+    functions: &'a BTreeSet<String>,
+    calls: &'a BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
     let mut reverse: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for func in functions {
         reverse.entry(func.as_str()).or_default();
@@ -152,29 +100,38 @@ fn find_sccs(
             }
         }
     }
+    reverse
+}
 
-    // Second DFS: find SCCs in reverse finish order
+/// Second pass of Kosaraju: DFS on reverse graph in reverse finish order to extract SCCs.
+fn extract_sccs(
+    finish_order: &[&str],
+    reverse: &BTreeMap<&str, BTreeSet<&str>>,
+) -> Vec<Vec<String>> {
     let mut visited: HashSet<&str> = HashSet::new();
     let mut sccs: Vec<Vec<String>> = Vec::new();
 
-    for func in finish_order.into_iter().rev() {
+    for &func in finish_order.iter().rev() {
         if !visited.contains(func) {
             let mut scc: Vec<String> = Vec::new();
-            dfs_reverse(func, &reverse, &mut visited, &mut scc);
+            dfs_reverse(func, reverse, &mut visited, &mut scc);
             scc.sort();
             sccs.push(scc);
         }
     }
 
-    // Build func -> SCC index mapping
+    sccs
+}
+
+/// Map each function name to its SCC index.
+fn build_scc_index(sccs: &[Vec<String>]) -> HashMap<String, usize> {
     let mut func_to_scc: HashMap<String, usize> = HashMap::new();
     for (scc_idx, scc) in sccs.iter().enumerate() {
         for func in scc {
             func_to_scc.insert(func.clone(), scc_idx);
         }
     }
-
-    (sccs, func_to_scc)
+    func_to_scc
 }
 
 fn dfs_forward<'a>(
@@ -186,7 +143,6 @@ fn dfs_forward<'a>(
 ) {
     visited.insert(node);
     if let Some(callees) = calls.get(node) {
-        // BTreeSet iterates in sorted order — deterministic
         for callee in callees {
             if functions.contains(callee) && !visited.contains(callee.as_str()) {
                 dfs_forward(callee, calls, functions, visited, finish_order);
@@ -205,7 +161,6 @@ fn dfs_reverse<'a>(
     visited.insert(node);
     scc.push(node.to_string());
     if let Some(callers) = reverse.get(node) {
-        // BTreeSet iterates in sorted order — deterministic
         for &caller in callers {
             if !visited.contains(caller) {
                 dfs_reverse(caller, reverse, visited, scc);
@@ -278,6 +233,28 @@ fn assign_scc_levels(num_sccs: usize, dag: &SccDag) -> Vec<usize> {
     levels
 }
 
+/// Place each function into its SCC's level, sorted alphabetically within each level.
+fn group_functions_by_level(
+    funcs: &BTreeSet<String>,
+    func_to_scc: &HashMap<String, usize>,
+    scc_levels: &[usize],
+) -> Vec<Vec<String>> {
+    let max_level = scc_levels.iter().copied().max().unwrap_or(0);
+    let mut groups: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
+
+    for func in funcs {
+        if let Some(&scc_idx) = func_to_scc.get(func.as_str()) {
+            groups[scc_levels[scc_idx]].push(func.clone());
+        }
+    }
+
+    for group in &mut groups {
+        group.sort();
+    }
+
+    groups
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -299,47 +276,6 @@ mod tests {
         map
     }
 
-    /// Verify the linearize ordering invariant: for every call edge where the
-    /// callee is at a strictly lower hierarchy level than the caller, the callee
-    /// appears before the caller in the linearized output. Intra-SCC edges
-    /// (same level) have no ordering constraint since cycles can't be linearized.
-    fn verify_linearize_order(
-        f: &HashSet<String>,
-        c: &HashMap<String, HashSet<String>>,
-        l: &[String],
-        h: &[Vec<String>],
-    ) {
-        let mut func_level: HashMap<&str, usize> = HashMap::new();
-        for (level, group) in h.iter().enumerate() {
-            for func in group {
-                func_level.insert(func, level);
-            }
-        }
-
-        for (caller, callees) in c {
-            if !f.contains(caller) {
-                continue;
-            }
-            let caller_pos = l.iter().position(|x| x == caller).unwrap();
-            let caller_level = func_level[caller.as_str()];
-            for callee in callees {
-                if !f.contains(callee) {
-                    continue;
-                }
-                let callee_level = func_level[callee.as_str()];
-                // Only check cross-SCC (cross-level) edges
-                if callee_level < caller_level {
-                    let callee_pos = l.iter().position(|x| x == callee).unwrap();
-                    assert!(
-                        callee_pos < caller_pos,
-                        "{} (level {}, pos {}) should appear before {} (level {}, pos {})",
-                        callee, callee_level, callee_pos, caller, caller_level, caller_pos
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn test_diamond() {
         // A -> B, A -> C, B -> D, C -> D
@@ -356,9 +292,6 @@ mod tests {
             vec!["B", "C"],
             vec!["A"],
         ]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["D", "B", "C", "A"]);
     }
 
     #[test]
@@ -369,9 +302,6 @@ mod tests {
 
         let h = hierarchy(&f, &c);
         assert_eq!(h, vec![vec!["C"], vec!["B"], vec!["A"]]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["C", "B", "A"]);
     }
 
     #[test]
@@ -381,9 +311,6 @@ mod tests {
 
         let h = hierarchy(&f, &c);
         assert_eq!(h, vec![vec!["A", "B", "C"]]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["A", "B", "C"]);
     }
 
     #[test]
@@ -394,9 +321,6 @@ mod tests {
 
         let h = hierarchy(&f, &c);
         assert_eq!(h, vec![vec!["A", "B"]]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["A", "B"]);
     }
 
     #[test]
@@ -407,9 +331,6 @@ mod tests {
 
         let h = hierarchy(&f, &c);
         assert_eq!(h, vec![vec!["C"], vec!["A", "B"]]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["C", "A", "B"]);
     }
 
     #[test]
@@ -441,16 +362,10 @@ mod tests {
             vec!["A", "G"],
             vec!["H"],
         ]);
-
-        let l = linearize(&f, &c);
-        // Alphabetical tie-breaking: C(level 1) before E before I,J; B before F; A before G
-        assert_eq!(l, vec!["D", "C", "B", "A", "E", "F", "G", "H", "I", "J"]);
-        verify_linearize_order(&f, &c, &l, &h);
     }
 
     #[test]
     fn test_determinism_stress() {
-        // Run both functions 10 times and verify identical output
         let f = funcs(&["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]);
         let c = edges(&[
             ("A", &["B", "C"]),
@@ -464,40 +379,10 @@ mod tests {
             ("J", &["I", "D"]),
         ]);
 
-        let expected_h = hierarchy(&f, &c);
-        let expected_l = linearize(&f, &c);
+        let expected = hierarchy(&f, &c);
 
         for i in 0..10 {
-            assert_eq!(hierarchy(&f, &c), expected_h, "hierarchy diverged on iteration {}", i);
-            assert_eq!(linearize(&f, &c), expected_l, "linearize diverged on iteration {}", i);
-        }
-    }
-
-    #[test]
-    fn test_linearize_invariant_holds() {
-        // For every test case, verify the cross-SCC ordering invariant:
-        // if callee is at a lower level than caller, callee appears first.
-        // Intra-SCC edges (cycles) have no ordering constraint.
-        let cases: Vec<(HashSet<String>, HashMap<String, HashSet<String>>)> = vec![
-            // Diamond
-            (funcs(&["A", "B", "C", "D"]), edges(&[
-                ("A", &["B", "C"]), ("B", &["D"]), ("C", &["D"]),
-            ])),
-            // Chain
-            (funcs(&["A", "B", "C"]), edges(&[("A", &["B"]), ("B", &["C"])])),
-            // Independent
-            (funcs(&["A", "B", "C"]), edges(&[])),
-            // Cycle
-            (funcs(&["A", "B"]), edges(&[("A", &["B"]), ("B", &["A"])])),
-            // Cycle + external
-            (funcs(&["A", "B", "C"]), edges(&[("A", &["B"]), ("B", &["A", "C"])])),
-        ];
-
-        for (f, c) in &cases {
-            let l = linearize(f, c);
-            let h = hierarchy(f, c);
-            assert_eq!(l.len(), f.len(), "linearize output missing functions");
-            verify_linearize_order(f, c, &l, &h);
+            assert_eq!(hierarchy(&f, &c), expected, "hierarchy diverged on iteration {}", i);
         }
     }
 
@@ -509,8 +394,5 @@ mod tests {
 
         let h = hierarchy(&f, &c);
         assert_eq!(h, vec![vec!["B"], vec!["A"]]);
-
-        let l = linearize(&f, &c);
-        assert_eq!(l, vec!["B", "A"]);
     }
 }
